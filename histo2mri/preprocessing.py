@@ -1,13 +1,11 @@
+"""Resample histology to MRI spacing and prepare histology and MRI-slab images for matching."""
 import numpy as np
 import SimpleITK as sitk
-import matplotlib.pyplot as plt
 from skimage import morphology
 from skimage.morphology import ball
-import os
+from .qc import show_proc_image
 
 
-# ------------------ PreStep : Histology Image preparation ------------------ #
-# This preparation step performs before finding approximately MRI slice
 def voxel_index_affine_hr_to_lr(spacing_hr, spacing_lr):
     """
     HR voxel index -> LR voxel index (homogeneous 4x4).
@@ -23,6 +21,7 @@ def voxel_index_affine_hr_to_lr(spacing_hr, spacing_lr):
     A[1, 1] = scale[1]
     A[2, 2] = scale[2]
     return A
+
 
 def resample_histo_to_mri(Ih_hr, Mh_hr, Im):
     hist_size = Ih_hr.GetSize()
@@ -161,6 +160,7 @@ def robust_intensity_prep(I, mask=None, pclip=(1, 99), eps=1e-8):
 
     return I01_np
 
+
 def scale_image_xy_grid(img, sx, sy, interp=sitk.sitkLinear):
     """
     Resamples onto a new grid by changing size/spacing (identity transform).
@@ -188,6 +188,7 @@ def scale_image_xy_grid(img, sx, sy, interp=sitk.sitkLinear):
     )
     return img_scaled, scaled_size
 
+
 def pad_xy_to_patch_multiple(img, patch_size, constant=0):
     """
     Pads ONLY X and Y to be divisible by patch_size. Z unchanged.
@@ -214,6 +215,7 @@ def pad_xy_to_patch_multiple(img, patch_size, constant=0):
         constant=constant
     )
     return padded, pad_lower, pad_upper
+
 
 def affine_lr_to_proc_voxel(Ih_lr, scaled_size_xyz, pad_lower_xyz):
     """
@@ -243,39 +245,8 @@ def affine_lr_to_proc_voxel(Ih_lr, scaled_size_xyz, pad_lower_xyz):
     A[2, 3] = 0.0
     return A
 
-def show_proc_image(img, mask, title, idx=0, save_file=None):
-    arr_img = sitk.GetArrayFromImage(img)[idx]
-    arr_mask = sitk.GetArrayFromImage(mask)[idx]
 
-    arr_img[arr_mask==0.0] = 0.0
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))  # 1 row, 2 columns
-
-    axes[0].imshow(np.flipud(arr_img), cmap='gray')
-    axes[0].set_title(f"Processed {title}")
-
-    axes[1].imshow(np.flipud(arr_mask), cmap='gray')
-    axes[1].set_title(f"Processed {title} Mask")
-
-    plt.tight_layout()
-    plt.show()
-
-    # Save figure
-    if save_file is not None:
-        os.makedirs(os.path.dirname(save_file), exist_ok=True)
-
-        fig2, ax2 = plt.subplots(figsize=(6, 6))
-        ax2.imshow(np.flipud(arr_img), cmap='gray')
-        ax2.set_title(f"Processed {title}")
-        ax2.axis("on")
-
-        fig2.tight_layout()
-        fig2.savefig(save_file, dpi=300, bbox_inches="tight")
-        plt.close(fig2)
-
-        print(f"Saved histology image to: {save_file}")
-
-def prepare_histo_regis(Ih, Mh, scale_ratio, patch_size, show_proc_img=False, save_file=None):
+def prepare_histology(Ih, Mh, scale_ratio, patch_size, show_proc_img=False, save_file=None):
     print("\n-------- Prepare Histology for Registration --------")
 
     sy, sx = scale_ratio
@@ -321,6 +292,7 @@ def dilate_mask(mri_mask, ball_size=3):
 
     return dilated_mask_image
 
+
 def prepare_mri_slab(Im, Mm, n_slices, show_proc_img=False, save_file=None, pclip=(1, 99)):
     print("\n-------- Prepare MRI Slab for Registration --------")
 
@@ -332,3 +304,4 @@ def prepare_mri_slab(Im, Mm, n_slices, show_proc_img=False, save_file=None, pcli
         show_proc_image(slab_Im, slab_Mm, idx=n_slices, title="MRI", save_file=save_file)
 
     return slab_raw_Im, slab_Im, slab_Mm
+

@@ -1,5 +1,67 @@
-import numpy as np
+"""Cubic sampling of 3D volumes, robust normalisation and monotone LUTs."""
+import SimpleITK as sitk
 import torch
+import torch.nn.functional as F
+import numpy as np
+
+
+def _prepare_data_tensor(sitk_img, device):
+    arr = sitk.GetArrayFromImage(sitk_img)
+    # Add a channel dimension if the image is scalar, then a batch dimension.
+    # 2D input        (H, W)     -> (1, 1, H, W)
+    # 3D input:
+    #   - (1, H, W)   -> treat as 2D slice -> (1, 1, H, W)
+    #   - (Z, Y, X)   -> 3D volume         -> (1, 1, Z, Y, X)
+    # 4D (already has channels)            -> just prepend batch.
+    tensor = torch.as_tensor(arr, dtype=torch.float32, device=device)
+
+    # If a 3D array has a singleton depth (1, H, W), squeeze it to 2D.
+    if tensor.ndim == 3 and tensor.shape[0] == 1:
+        tensor = tensor.squeeze(0)                # (H, W)
+
+    if tensor.ndim == 2:
+        tensor = tensor.unsqueeze(0)              # (1, H, W)
+    elif tensor.ndim == 3:
+        tensor = tensor.unsqueeze(0)              # (1, Z, Y, X)
+    elif tensor.ndim != 4:
+        raise ValueError(f"Unexpected image dims {tensor.shape}; expected 2D or 3D scalar image.")
+
+    return tensor.unsqueeze(0)                    # prepend batch -> (1, C, ...)
+
+
+def sample_mri_on_sheet(mri_t, mri_mask_t, xyz_norm_sheet):
+    xg = 2*xyz_norm_sheet[..., 0] - 1.0
+    yg = 2*xyz_norm_sheet[..., 1] - 1.0
+    zg = 2*xyz_norm_sheet[..., 2] - 1.0
+
+    # Build grid: (1, 1, H, W, 3)
+    grid = torch.stack([xg, yg, zg], dim=-1).unsqueeze(0).unsqueeze(1)  # (1,1,H,W,3)
+
+    # Build grid: (1, 1, H, W, 3)
+    warped3d = F.grid_sample(
+        mri_t, grid,
+        mode='bilinear',
+        padding_mode='border',
+        align_corners=True
+        )
+    warped3d_mask = F.grid_sample(
+        mri_mask_t, grid,
+        mode='nearest',
+        padding_mode='zeros',
+        align_corners=True
+        )
+
+    # Extract the 2D slice: (1, 1, H, W)
+    warped2d = warped3d[:, :, 0, :, :]
+    warped2d_mask = warped3d_mask[:, :, 0, :, :]
+
+    # Ensure mask is binary (if it is not already)
+    warped2d_mask = (warped2d_mask > 0).float()
+
+    # Apply mask
+    warped2d_masked = warped2d * warped2d_mask
+
+    return warped2d_masked
 
 
 def robust01(img, mask=None, pclip=(1, 99), eps=1e-8):
@@ -17,6 +79,7 @@ def robust01(img, mask=None, pclip=(1, 99), eps=1e-8):
             lo, hi = float(vals.min()), float(vals.max())
     x01 = np.clip((x - lo) / (hi - lo + eps), 0.0, 1.0)
     return x01.astype(np.float32), (lo, hi)
+
 
 def make_monotone_lut(
     src01,
@@ -69,10 +132,12 @@ def make_monotone_lut(
 
     return xq_u.astype(np.float32), yq_u.astype(np.float32)
 
+
 def apply_lut_monotone(src01, xq, yq):
     # Map src01 in [0,1] via piecewise linear, saturate outside
     out = np.interp(src01.ravel(), xq, yq).reshape(src01.shape).astype(np.float32)
     return out
+
 
 # =========================
 # Cubic kernels + 3D sampler (your clamp-free version)
@@ -99,6 +164,7 @@ def cubic_weights_catmull_rom(t: torch.Tensor, a: float = -0.5):
 
     return torch.stack([phi(x0), phi(x1), phi(x2), phi(x3)], dim=-1)
 
+
 def cubic_weights_bspline(t: torch.Tensor):
     t2 = t * t
     t3 = t2 * t
@@ -108,6 +174,7 @@ def cubic_weights_bspline(t: torch.Tensor):
     w3 = t3 / 6
     return torch.stack([w0, w1, w2, w3], dim=-1)
 
+
 def _reflect_indices(i: torch.Tensor, n: int) -> torch.Tensor:
     if n <= 1:
         return torch.zeros_like(i)
@@ -115,6 +182,7 @@ def _reflect_indices(i: torch.Tensor, n: int) -> torch.Tensor:
     r = torch.remainder(i, period)
     r = torch.where(r < 0, r + period, r)
     return torch.where(r > (n - 1), period - r, r)
+
 
 def _wrap_indices(i: torch.Tensor, n: int) -> torch.Tensor:
     if n <= 1:
@@ -199,3 +267,4 @@ def sample_mri_cubic_3d(
 
     out = (vals * w64).sum(dim=1).reshape(1, 1, H, W)
     return out
+

@@ -1,11 +1,7 @@
+"""Map the refined surface back into high-resolution histology space."""
 import numpy as np
 import torch
 import SimpleITK as sitk
-from matplotlib import pyplot as plt
-import os
-
-from utilities import sample_mri_cubic_3d, robust01, make_monotone_lut, apply_lut_monotone
-
 from scipy.ndimage import (
     gaussian_filter,
     maximum_filter1d,
@@ -14,33 +10,8 @@ from scipy.ndimage import (
     map_coordinates,
 )
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
-
-# ============================================================
-# v12 = v7 + the "MRI on Histology Space" stage lifted out of the notebook.
-#
-# v7 already held the low-level pieces (affine builders, the scatter/splat
-# backprojection, the visual checks).  What lived inline in the notebook was the
-# stage that ties them together:
-#
-#   1. compose the HR <-> common-canvas affine from the three sub-affines
-#   2. build target_valid_mask: where in HR histology space is the surface
-#      actually able to deliver a sample
-#   3. pull the MRI through, densely, at HR resolution, tile by tile:
-#         HR pixel -> common space -> surface index -> xyz_norm_final -> MRI
-#
-# Those are now build_A_hr_common(), build_target_valid_mask() and
-# resample_mri_to_hr(), with mri_on_histology_space() as the single entry point
-# -- the same shape as refine_curved_sheet() in ddf_estimation_v12.
-#
-# This is a pure refactor.  Every array it produces is bit-identical to what the
-# notebook cells produced; the extraction is verified against a literal copy of
-# those cells.  No parameter was retuned.
-#
-# NOTE on the affine: A_common_to_hr is built from a chain of diagonal-plus-
-# translation matrices, so its [0,0] and [1,1] entries are the x/y scales.
-# build_target_valid_mask() relies on that to size its smoothing kernels.  It
-# warns (rather than silently misbehaving) if a rotation ever appears there.
-# ============================================================
+from .qc import plot_mri_on_histology
+from .sampling import sample_mri_cubic_3d
 
 
 def make_A_proc_to_scaled(proc_Ih, scaled_proc_Ih):
@@ -51,11 +22,13 @@ def make_A_proc_to_scaled(proc_Ih, scaled_proc_Ih):
     A[1, 1] = sy
     return A
 
+
 def make_A_scaled_to_common(oy, ox):
     A = np.eye(4, dtype=np.float64)
     A[0, 3] = float(ox)  # x shift
     A[1, 3] = float(oy)  # y shift
     return A
+
 
 @torch.no_grad()
 def inverse_surface_image_to_hr(
@@ -184,233 +157,6 @@ def inverse_surface_image_to_hr(
     return out
 
 
-def normalize_image(img, eps=1e-8):
-    """Normalize image to [0, 1]."""
-    img = img.astype(np.float32)
-    min_val = img.min()
-    max_val = img.max()
-    return (img - min_val) / (max_val - min_val + eps)
-
-def make_checkerboard(a, b, tile_size=32):
-    """
-    Create a checkerboard composite of two normalized images.
-    Both must have the same shape.
-    """
-    if a.shape != b.shape:
-        raise ValueError(f"Shape mismatch: {a.shape} vs {b.shape}")
-
-    # Normalize both images
-    a_norm = normalize_image(a)
-    b_norm = normalize_image(b)
-
-    h, w = a.shape
-
-    yy, xx = np.indices((h, w))
-    mask = ((yy // tile_size + xx // tile_size) % 2).astype(bool)
-
-    out = np.where(mask, a_norm, b_norm)
-    return out
-
-# Precheck: visualize sampled mri on histology space
-def check_mri_on_histo(mri_on_histo, Ih_hr, Mh_hr, tile_size=384, save_file=None, save_file_single=None):
-    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
-    axes = axes.ravel()
-
-    arr_Ih_hr = sitk.GetArrayFromImage(Ih_hr)[0]
-    arr_Mh_hr = sitk.GetArrayFromImage(Mh_hr)[0]
-
-    hist_disp = np.flipud(arr_Ih_hr).astype(np.float32)
-    mri_disp  = np.flipud(mri_on_histo).astype(np.float32)
-    mask_disp = np.flipud(arr_Mh_hr).astype(np.float32)
-
-    # keep same behavior as final-check style, but in histology support
-    hist_disp = hist_disp * mask_disp
-    mri_disp  = mri_disp * mask_disp
-
-    mask_src = None
-    mask_ref = None
-    h01, _ = robust01(hist_disp, mask=mask_src, pclip=(1, 99))
-    mri_lut, _ = robust01(mri_disp, mask=mask_ref, pclip=(1, 99))
-
-    xq, yq = make_monotone_lut(
-        src01=h01, ref01=mri_lut,
-        src_mask=mask_src, ref_mask=mask_ref,
-        n_quant=2048
-    )
-    histo_lut = apply_lut_monotone(h01, xq, yq)
-
-    hist_norm = hist_disp
-    mri_norm  = mri_disp
-
-    axes[0].imshow(hist_norm, cmap='gray')
-    axes[0].set_title("Histology on histology space")
-
-    axes[1].imshow(mri_norm, cmap='gray')
-    axes[1].set_title("MRI on histology space")
-
-    checker = make_checkerboard(hist_norm, mri_norm, tile_size=tile_size)
-    axes[2].imshow(checker, cmap='gray')
-    axes[2].set_title(f"Checkerboard (tile={tile_size})")
-
-    axes[3].imshow(histo_lut, cmap='gray')
-    axes[3].set_title("Histology on histology space")
-
-    axes[4].imshow(mri_lut, cmap='gray')
-    axes[4].set_title("MRI on histology space")
-
-    checker_lut = make_checkerboard(histo_lut, mri_lut, tile_size=tile_size)
-    axes[5].imshow(checker_lut, cmap='gray')
-    axes[5].set_title(f"Checkerboard (tile={tile_size})")
-
-    plt.tight_layout()
-
-    if save_file is not None:
-        os.makedirs(os.path.dirname(save_file), exist_ok=True)
-        fig.savefig(save_file, dpi=300, bbox_inches="tight")
-        print(f"Saved figure to: {save_file}")
-
-    plt.show()
-
-    if save_file_single is not None:
-        os.makedirs(os.path.dirname(save_file_single), exist_ok=True)
-        fig2, ax2 = plt.subplots(figsize=(6, 6))
-        ax2.imshow(mri_disp, cmap='gray')
-        ax2.set_title("MRI on histology space")
-        ax2.axis("on")
-        fig2.tight_layout()
-        fig2.savefig(save_file_single, dpi=300, bbox_inches="tight")
-        plt.close(fig2)
-        print(f"Saved image to: {save_file_single}")
-
-def check_mri_on_histo_rgb(
-    arr_Ih_hr,
-    arr_Ih_rgb_hr,
-    mri_clean,
-    arr_Mh_hr=None,
-    tile=384,
-    pclip=(1, 99),
-    n_quant=2048,
-    save_file=None,
-    flip_display=False,
-):
-    def _to_np(x):
-        if isinstance(x, sitk.Image):
-            return sitk.GetArrayFromImage(x)
-        return np.asarray(x)
-
-    def to_gray2d(a, name):
-        a = _to_np(a)
-        if a.ndim == 2:
-            return a.astype(np.float32)
-        if a.ndim == 3 and a.shape[0] == 1:
-            return a[0].astype(np.float32)
-        if a.ndim == 3 and a.shape[-1] == 1:
-            return a[..., 0].astype(np.float32)
-        raise ValueError(f"{name} must be 2D grayscale (or singleton 3D), got {a.shape}")
-
-    def to_rgb3(a, name):
-        a = _to_np(a)
-        if a.ndim == 3 and a.shape[-1] == 3:
-            return a.astype(np.float32)
-        raise ValueError(f"{name} must be RGB with shape (H,W,3), got {a.shape}")
-
-    hist_gray = to_gray2d(arr_Ih_hr, "arr_Ih_hr")
-    hist_rgb  = to_rgb3(arr_Ih_rgb_hr, "arr_Ih_rgb_hr")
-    mri_gray  = to_gray2d(mri_clean, "mri_clean")
-
-    if hist_gray.shape != mri_gray.shape:
-        raise ValueError(f"Shape mismatch: hist_gray {hist_gray.shape} vs mri_gray {mri_gray.shape}")
-    if hist_rgb.shape[:2] != hist_gray.shape:
-        raise ValueError(f"Shape mismatch: hist_rgb {hist_rgb.shape} vs hist_gray {hist_gray.shape}")
-
-    mask = None
-    if arr_Mh_hr is not None:
-        mask = (to_gray2d(arr_Mh_hr, "arr_Mh_hr") > 0)
-        if mask.shape != hist_gray.shape:
-            raise ValueError(f"Mask shape mismatch: {mask.shape} vs {hist_gray.shape}")
-
-    if mask is not None:
-        hist_gray = hist_gray * mask
-        mri_gray  = mri_gray * mask
-        hist_rgb  = hist_rgb * mask[..., None]
-
-    h01, _ = robust01(hist_gray, mask=mask, pclip=pclip)
-    m01, _ = robust01(mri_gray,  mask=mask, pclip=pclip)
-
-    xq, yq = make_monotone_lut(
-        src01=h01, ref01=m01,
-        src_mask=mask, ref_mask=mask,
-        n_quant=n_quant
-    )
-    histo_lut = apply_lut_monotone(h01, xq, yq)
-
-    rgb = hist_rgb.copy()
-    if rgb.max() > 1.0:
-        rgb /= 255.0
-
-    mri_rgb = np.repeat(m01[..., None], 3, axis=-1)
-
-    yy, xx = np.indices(h01.shape)
-    cb = ((yy // int(tile) + xx // int(tile)) % 2 == 0)
-
-    checker_lut = np.where(cb, histo_lut, m01)
-    checker_rgb = np.where(cb[..., None], rgb, mri_rgb)
-
-    if mask is not None:
-        histo_lut_disp   = np.where(mask, histo_lut, 1.0)
-        m01_disp         = np.where(mask, m01, 1.0)
-        checker_lut_disp = np.where(mask, checker_lut, 1.0)
-        rgb_disp         = np.where(mask[..., None], rgb, 1.0)
-        checker_rgb_disp = np.where(mask[..., None], checker_rgb, 1.0)
-        mask_disp        = mask.astype(np.float32)
-    else:
-        histo_lut_disp   = histo_lut
-        m01_disp         = m01
-        checker_lut_disp = checker_lut
-        rgb_disp         = rgb
-        checker_rgb_disp = checker_rgb
-        mask_disp        = np.ones_like(h01, dtype=np.float32)
-
-    if flip_display:
-        histo_lut_disp   = np.flipud(histo_lut_disp)
-        m01_disp         = np.flipud(m01_disp)
-        checker_lut_disp = np.flipud(checker_lut_disp)
-        rgb_disp         = np.flipud(rgb_disp)
-        checker_rgb_disp = np.flipud(checker_rgb_disp)
-        mask_disp        = np.flipud(mask_disp)
-
-    fig, ax = plt.subplots(2, 3, figsize=(20, 14))
-
-    ax[0, 0].imshow(histo_lut_disp, cmap="gray", origin="lower")
-    ax[0, 0].set_title("Histology (LUT -> MRI)")
-    ax[0, 1].imshow(m01_disp, cmap="gray", origin="lower")
-    ax[0, 1].set_title("MRI (robust01)")
-    ax[0, 2].imshow(checker_lut_disp, cmap="gray", origin="lower")
-    ax[0, 2].set_title(f"Checkerboard LUT (tile={tile})")
-
-    ax[1, 0].imshow(rgb_disp, origin="lower")
-    ax[1, 0].set_title("RGB Histo")
-    ax[1, 1].imshow(m01_disp, cmap="gray", origin="lower")
-    ax[1, 1].set_title("MRI on Histo")
-    ax[1, 2].imshow(checker_rgb_disp, origin="lower")
-    ax[1, 2].set_title(f"Checkerboard RGB (tile={tile})")
-
-    for a in ax.ravel():
-        a.axis("off")
-
-    fig.tight_layout()
-
-    if save_file is not None:
-        d = os.path.dirname(save_file)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        fig.savefig(save_file, dpi=300, bbox_inches="tight")
-        print(f"Saved: {save_file}")
-
-    plt.show()
-    plt.close(fig)
-
-
 # ============================================================
 # MRI on Histology Space  (lifted from pipeline notebook)
 # ============================================================
@@ -441,7 +187,7 @@ def _scale_from_affine(A):
     return max(1.0, float(abs(A[0, 0]))), max(1.0, float(abs(A[1, 1])))
 
 
-def build_A_hr_common(proc_Ih, scaled_proc_Ih, A_hr_to_proc, oy_h, ox_h):
+def build_hr_common_affines(proc_Ih, scaled_proc_Ih, A_hr_to_proc, oy_h, ox_h):
     """Compose the HR-histology <-> common-canvas index affines.
 
     Returns (A_hr_to_common, A_common_to_hr), both 4x4 float64.
@@ -488,7 +234,7 @@ def build_target_valid_mask(
     )
     support_w_hr = np.asarray(support_w_hr, dtype=np.float32)
 
-    arr_Mh_hr = sitk.GetArrayFromImage(Mh_hr).astype(bool) if isinstance(Mh_hr, sitk.Image) \
+    arr_Mh_hr = sitk.GetArrayFromImage(Mh_hr).astype(bool) if isinstance(Mh_hr, sitk.Image)\
         else np.asarray(Mh_hr).astype(bool)
     if arr_Mh_hr.ndim == 3 and arr_Mh_hr.shape[0] == 1:
         arr_Mh_hr = arr_Mh_hr[0]
@@ -596,7 +342,7 @@ def resample_mri_to_hr(
     row_near = NearestNDInterpolator(pts_common, surf_r.astype(np.float32))
     col_near = NearestNDInterpolator(pts_common, surf_c.astype(np.float32))
 
-    vol_arr = sitk.GetArrayFromImage(slab_Im).astype(np.float32) if isinstance(slab_Im, sitk.Image) \
+    vol_arr = sitk.GetArrayFromImage(slab_Im).astype(np.float32) if isinstance(slab_Im, sitk.Image)\
         else np.asarray(slab_Im, dtype=np.float32)
     if vol_arr.ndim == 2:
         vol_arr = vol_arr[None]
@@ -730,7 +476,7 @@ def mri_on_histology_space(
     """
     print("\n-------- MRI on Histology Space --------")
 
-    A_hr_to_common, A_common_to_hr = build_A_hr_common(
+    A_hr_to_common, A_common_to_hr = build_hr_common_affines(
         proc_Ih, scaled_proc_Ih, A_hr_to_proc, oy_h, ox_h
     )
 
@@ -760,7 +506,7 @@ def mri_on_histology_space(
     )
 
     if show_proc_img:
-        check_mri_on_histo(
+        plot_mri_on_histology(
             mri_on_hr, Ih_hr, Mh_hr,
             tile_size=tile_size,
             save_file=save_file,
@@ -775,3 +521,4 @@ def mri_on_histology_space(
         Hhr=Hhr, Whr=Whr,
     )
     return mri_on_hr, final_valid_hr, A_hr_to_common, A_common_to_hr, info
+

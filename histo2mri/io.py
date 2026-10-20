@@ -1,13 +1,8 @@
-"""Section/subject loading helpers for the publishable batch pipeline (pipeline_run.py).
-
-Deliberately independent from annotations_run.py (which is internal-only tooling) so this
-module can be published standalone. Reads the same sections-csv format
-(subject_id, slice_id/block_id/stain, orientation, spacing, optional flip).
-"""
+"""Load one histology section and its MRI volume, and parse the sections CSV."""
 import os
-
 import numpy as np
 import SimpleITK as sitk
+
 
 ORIENTATION_PERMUTE = {
     "axial": [0, 1, 2],
@@ -106,3 +101,4 @@ def load_section(subject_id, num_str, histo_type, spacing, orientation, flip, da
     Mm = sitk.PermuteAxes(Mm, permute_axes)
 
     return {"Ih_hr": Ih_hr, "Mh_hr": Mh_hr, "Im": Im, "Mm": Mm, "Ih_rgb_hr": Ih_rgb_hr}
+

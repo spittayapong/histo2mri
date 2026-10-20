@@ -1,0 +1,665 @@
+"""Quality-control figures."""
+import numpy as np
+import SimpleITK as sitk
+import matplotlib.pyplot as plt
+import os
+import torch
+import math
+from .outliers import _extract_match_points
+from .sampling import apply_lut_monotone, make_monotone_lut, robust01
+
+
+def show_proc_image(img, mask, title, idx=0, save_file=None):
+    arr_img = sitk.GetArrayFromImage(img)[idx]
+    arr_mask = sitk.GetArrayFromImage(mask)[idx]
+
+    arr_img[arr_mask==0.0] = 0.0
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))  # 1 row, 2 columns
+
+    axes[0].imshow(np.flipud(arr_img), cmap='gray')
+    axes[0].set_title(f"Processed {title}")
+
+    axes[1].imshow(np.flipud(arr_mask), cmap='gray')
+    axes[1].set_title(f"Processed {title} Mask")
+
+    plt.tight_layout()
+    plt.show()
+
+    # Save figure
+    if save_file is not None:
+        os.makedirs(os.path.dirname(save_file), exist_ok=True)
+
+        fig2, ax2 = plt.subplots(figsize=(6, 6))
+        ax2.imshow(np.flipud(arr_img), cmap='gray')
+        ax2.set_title(f"Processed {title}")
+        ax2.axis("on")
+
+        fig2.tight_layout()
+        fig2.savefig(save_file, dpi=300, bbox_inches="tight")
+        plt.close(fig2)
+
+        print(f"Saved histology image to: {save_file}")
+
+
+# Visualization Debugger
+
+def show_matched_pairs(
+    matches,
+    hist_img,
+    mri_img,
+    patch=64,
+    ncols=3,
+    max_pairs=None,
+    sort_by_score=True,
+    save_file=None,
+    hist_mask=None,
+    mri_mask=None,
+):
+    vals = [m for m in matches if m["mri_center_zyx"][0] >= 0]
+    if len(vals) == 0:
+        print("No valid matches.")
+        return
+
+    if sort_by_score:
+        vals = sorted(vals, key=lambda d: d["score"], reverse=True)
+    if max_pairs is not None:
+        vals = vals[:max_pairs]
+
+    show_overlap = (hist_mask is not None) and (mri_mask is not None)
+    panels_per_pair = 3 if show_overlap else 2
+
+    n = len(vals)
+    rows = math.ceil(n / ncols)
+
+    fig, axes = plt.subplots(
+        rows,
+        ncols * panels_per_pair,
+        figsize=(3 * panels_per_pair * ncols, 3 * rows)
+    )
+    axes = np.array(axes).reshape(rows, ncols * panels_per_pair)
+
+    for r in range(rows):
+        for c in range(ncols * panels_per_pair):
+            axes[r, c].axis("off")
+
+    for k, m in enumerate(vals):
+        r = k // ncols
+        g = k % ncols
+
+        c0 = panels_per_pair * g
+        c1 = c0 + 1
+        c2 = c0 + 2 if show_overlap else None
+
+        hy0, hx0 = m["hist_topleft_yx"]
+        mz, my0, mx0 = m["mri_topleft_zyx"]
+
+        hp = hist_img[hy0:hy0 + patch, hx0:hx0 + patch]
+        mp = mri_img[mz, my0:my0 + patch, mx0:mx0 + patch]
+
+        axes[r, c0].imshow(np.flipud(hp), cmap="gray")
+        axes[r, c0].set_title(
+            f"Hist idx={m['hist_index']} center={m['hist_center_yx']}",
+            fontsize=9
+        )
+        axes[r, c0].axis("off")
+
+        axes[r, c1].imshow(np.flipud(mp), cmap="gray")
+        axes[r, c1].set_title(
+            f"MRI {m['mri_center_zyx']} score={m['score']:.3f}",
+            fontsize=9
+        )
+        axes[r, c1].axis("off")
+
+        if show_overlap:
+            hm = hist_mask[hy0:hy0 + patch, hx0:hx0 + patch] > 0
+            mm = mri_mask[mz, my0:my0 + patch, mx0:mx0 + patch] > 0
+
+            overlap = hm & mm
+            overlap_frac = overlap.mean()
+
+            axes[r, c2].imshow(np.flipud(overlap.astype(np.uint8) * 255), cmap="gray", vmin=0, vmax=255)
+            axes[r, c2].set_title(f"Overlap frac={overlap_frac:.3f}", fontsize=9)
+            axes[r, c2].axis("off")
+
+    plt.tight_layout()
+
+    if save_file is not None:
+        os.makedirs(os.path.dirname(save_file), exist_ok=True) if os.path.dirname(save_file) else None
+        fig.savefig(save_file, dpi=200, bbox_inches="tight")
+        print(f"Saved figure to: {save_file}")
+
+    plt.show()
+
+
+def fit_plane_z_ax_by_c(pts_zyx, weights=None):
+    z = pts_zyx[:, 0].astype(np.float64)
+    y = pts_zyx[:, 1].astype(np.float64)
+    x = pts_zyx[:, 2].astype(np.float64)
+    A = np.stack([x, y, np.ones_like(x)], axis=1)
+
+    if weights is not None:
+        w = np.sqrt(np.clip(weights, 1e-8, None))
+        Aw = A * w[:, None]
+        zw = z * w
+        a, b, c = np.linalg.lstsq(Aw, zw, rcond=None)[0]
+    else:
+        a, b, c = np.linalg.lstsq(A, z, rcond=None)[0]
+
+    return float(a), float(b), float(c)
+
+
+def _to_zyx_volume(vol):
+    if sitk is not None and isinstance(vol, sitk.Image):
+        arr = sitk.GetArrayFromImage(vol)  # [Z,Y,X]
+    else:
+        arr = np.asarray(vol)
+    if arr.ndim == 2:
+        arr = arr[None, ...]
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 3D volume [Z,Y,X], got shape={arr.shape}")
+    return arr.astype(np.float32)
+
+
+def _make_xz_canvas(vol_zyx, z_min, z_max, mode="mip"):
+    Z, Y, X = vol_zyx.shape
+    z_min = int(max(0, z_min))
+    z_max = int(min(Z - 1, z_max))
+    band = vol_zyx[z_min:z_max + 1]  # [zb,Y,X]
+
+    if mode == "mean":
+        proj = band.mean(axis=1)  # [zb,X]
+    else:
+        proj = band.max(axis=1)   # [zb,X] mip over Y
+
+    canvas = np.zeros((Z, X), dtype=np.float32)  # full Z range
+    canvas[z_min:z_max + 1, :] = proj
+    return canvas
+
+
+def _make_yz_canvas(vol_zyx, z_min, z_max, mode="mip"):
+    Z, Y, X = vol_zyx.shape
+    z_min = int(max(0, z_min))
+    z_max = int(min(Z - 1, z_max))
+    band = vol_zyx[z_min:z_max + 1]  # [zb,Y,X]
+
+    if mode == "mean":
+        proj = band.mean(axis=2)  # [zb,Y]
+    else:
+        proj = band.max(axis=2)   # [zb,Y] mip over X
+
+    canvas = np.zeros((Z, Y), dtype=np.float32)  # full Z range
+    canvas[z_min:z_max + 1, :] = proj
+    return canvas
+
+
+def visualize_roi_from_matches(
+    matches,
+    mri_vol,
+    z_min=None,
+    z_max=None,
+    score_key="score",
+    max_points=50000,
+    plane_stride=16,
+    mode="mip",           # "mip" or "mean" for XZ/YZ background
+    elev=20,
+    azim=35,
+    use_score_weight=True,
+    figsize=(18, 5),
+    save_file=None,
+):
+    """
+    One figure, 3 columns:
+      [0] 3D points + fitted plane
+      [1] XZ overlay
+      [2] YZ overlay
+    """
+    # expects your existing helpers:
+    # _to_zyx_volume, _extract_match_points, _fit_plane_z_eq_ax_by_c,
+    # _make_xz_canvas, _make_yz_canvas
+    vol = _to_zyx_volume(mri_vol)  # [Z,Y,X]
+    Z, Y, X = vol.shape
+
+    if z_min is None:
+        z_min = 0
+    if z_max is None:
+        z_max = Z - 1
+    z_min = int(max(0, z_min))
+    z_max = int(min(Z - 1, z_max))
+
+    pts, sc = _extract_match_points(matches, score_key=score_key, z_min=z_min, z_max=z_max)
+    if len(pts) < 3:
+        print("Not enough valid points for visualization.")
+        return None
+
+    if len(pts) > max_points:
+        idx = np.random.choice(len(pts), max_points, replace=False)
+        pts, sc = pts[idx], sc[idx]
+
+    # weighted plane fit
+    w = None
+    if use_score_weight:
+        s = sc - np.min(sc)
+        w = s / (np.max(s) + 1e-8)
+    a, b, c = fit_plane_z_ax_by_c(pts, weights=w)
+
+    # plane mesh for 3D panel
+    xx = np.arange(0, X, plane_stride, dtype=np.float32)
+    yy = np.arange(0, Y, plane_stride, dtype=np.float32)
+    XX, YY = np.meshgrid(xx, yy)
+    ZZ = np.clip(a * XX + b * YY + c, 0, Z - 1)
+
+    # XZ/YZ canvases
+    def _norm01_img(a):
+        lo, hi = np.percentile(a, 1), np.percentile(a, 99)
+        return np.clip((a - lo) / (hi - lo + 1e-8), 0, 1)
+
+    canvas_xz = _norm01_img(_make_xz_canvas(vol, z_min, z_max, mode=mode))
+    canvas_yz = _norm01_img(_make_yz_canvas(vol, z_min, z_max, mode=mode))
+
+    z, y, x = pts[:, 0], pts[:, 1], pts[:, 2]
+
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    gs = fig.add_gridspec(1, 3, width_ratios=[1.15, 1.0, 1.0])
+
+    # (1) 3D
+    ax0 = fig.add_subplot(gs[0, 0], projection="3d")
+    p0 = ax0.scatter(x, y, z, c=sc, s=8, cmap="turbo", alpha=0.9)
+    ax0.plot_surface(XX, YY, ZZ, alpha=0.28, color="cyan", linewidth=0, antialiased=False)
+    ax0.set_xlim(0, X - 1); ax0.set_ylim(0, Y - 1); ax0.set_zlim(0, Z - 1)
+    ax0.set_xlabel("X"); ax0.set_ylabel("Y"); ax0.set_zlabel("Z")
+    ax0.set_title("3D points + fitted plane")
+    ax0.view_init(elev=elev, azim=azim)
+
+    # (2) XZ
+    ax1 = fig.add_subplot(gs[0, 1])
+    ax1.imshow(canvas_xz, cmap="gray", origin="lower", extent=[0, X - 1, 0, Z - 1], aspect="auto")
+    p1 = ax1.scatter(x, z, c=sc, s=10, cmap="turbo", alpha=0.9)
+    ax1.set_xlim(0, X - 1); ax1.set_ylim(0, Z - 1)
+    ax1.set_xlabel("X"); ax1.set_ylabel("Z")
+    ax1.set_title(f"XZ overlay ({mode})")
+
+    # (3) YZ
+    ax2 = fig.add_subplot(gs[0, 2])
+    ax2.imshow(canvas_yz, cmap="gray", origin="lower", extent=[0, Y - 1, 0, Z - 1], aspect="auto")
+    p2 = ax2.scatter(y, z, c=sc, s=10, cmap="turbo", alpha=0.9)
+    ax2.set_xlim(0, Y - 1); ax2.set_ylim(0, Z - 1)
+    ax2.set_xlabel("Y"); ax2.set_ylabel("Z")
+    ax2.set_title(f"YZ overlay ({mode})")
+
+    # one shared colorbar
+    fig.colorbar(p2, ax=[ax0, ax1, ax2], shrink=0.8, label=score_key)
+
+    if save_file is not None:
+        import os
+        save_dir = os.path.dirname(save_file)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        fig.savefig(save_file, dpi=200, bbox_inches="tight")
+        print(f"Saved figure to: {save_file}")
+
+    print(f"Fitted plane: z = {a:.5f}*x + {b:.5f}*y + {c:.5f}")
+    plt.show()
+
+    return {"a": float(a), "b": float(b), "c": float(c), "n_points": int(len(pts))}
+
+
+def plot_mri_on_sheet(
+    hist_on_init_tps,
+    valid_display,
+    mri_on_final_sheet,
+    save_file=None,
+    save_file_single=None,
+    show_checker=True,
+    checker_tile=24,
+    flip_display=False,
+):
+
+    def _to_numpy(x):
+        if isinstance(x, sitk.Image):
+            return sitk.GetArrayFromImage(x)
+        if torch is not None and torch.is_tensor(x):
+            return x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    def _to_2d(x, dtype=np.float32):
+        a = _to_numpy(x)
+        if a.ndim == 3 and a.shape[0] == 1:
+            a = a[0]
+        if a.ndim != 2:
+            raise ValueError(f"Expected 2D or [1,H,W], got {a.shape}")
+        return a.astype(dtype, copy=False)
+
+    def _norm01(a, eps=1e-8):
+        mn, mx = float(np.nanmin(a)), float(np.nanmax(a))
+        if mx <= mn + eps:
+            return np.zeros_like(a, dtype=np.float32)
+        return (a - mn) / (mx - mn + eps)
+
+    def _checker(a, b, tile=24):
+        aa, bb = _norm01(a), _norm01(b)
+        yy, xx = np.indices(aa.shape)
+        m = ((yy // tile + xx // tile) % 2).astype(bool)
+        return np.where(m, aa, bb)
+
+    h = _to_2d(hist_on_init_tps, dtype=np.float32)
+    v = _to_2d(valid_display, dtype=np.float32) > 0.5
+    r = _to_2d(mri_on_final_sheet, dtype=np.float32)
+
+    if h.shape != r.shape:
+        raise ValueError(f"Shape mismatch hist {h.shape} vs mri {r.shape}")
+    if v.shape != h.shape:
+        raise ValueError(f"valid_display shape mismatch {v.shape} vs hist {h.shape}")
+
+    h_disp = h.copy()
+    r_disp = r.copy()
+    h_disp[~v] = 0.0
+    r_disp[~v] = 0.0
+
+    if flip_display:
+        h_disp = np.flipud(h_disp)
+        r_disp = np.flipud(r_disp)
+        v = np.flipud(v)
+
+    ncols = 4 if show_checker else 3
+    fig, ax = plt.subplots(1, ncols, figsize=(5 * ncols, 5))
+
+    ax[0].imshow(h_disp, cmap="gray", origin="lower")
+    ax[0].set_title("Target Histology on Sheet")
+
+    ax[1].imshow(v.astype(np.float32), cmap="gray", origin="lower")
+    ax[1].set_title("Valid Display Region")
+
+    ax[2].imshow(r_disp, cmap="gray", origin="lower")
+    ax[2].set_title("MRI on Final Sheet")
+
+    if show_checker:
+        ax[3].imshow(_checker(h_disp, r_disp, tile=checker_tile), cmap="gray", origin="lower")
+        ax[3].set_title(f"Checkerboard (tile={checker_tile})")
+
+    for a in ax:
+        a.axis("off")
+    fig.tight_layout()
+
+    if save_file is not None:
+        d = os.path.dirname(save_file)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        fig.savefig(save_file, dpi=300, bbox_inches="tight")
+        print(f"Saved: {save_file}")
+
+    plt.show()
+    plt.close(fig)
+
+    if save_file_single is not None:
+        d = os.path.dirname(save_file_single)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        fig3, ax3 = plt.subplots(figsize=(6, 6))
+        ax3.imshow(r_disp, cmap="gray", origin="lower")
+        ax3.axis("off")
+        fig3.tight_layout(pad=0)
+        fig3.savefig(save_file_single, dpi=300, bbox_inches="tight", pad_inches=0)
+        plt.close(fig3)
+        print(f"Saved mri_on_final_sheet to: {save_file_single}")
+
+    return h_disp, v.astype(np.float32), r_disp, v
+
+
+def normalize_image(img, eps=1e-8):
+    """Normalize image to [0, 1]."""
+    img = img.astype(np.float32)
+    min_val = img.min()
+    max_val = img.max()
+    return (img - min_val) / (max_val - min_val + eps)
+
+
+def make_checkerboard(a, b, tile_size=32):
+    """
+    Create a checkerboard composite of two normalized images.
+    Both must have the same shape.
+    """
+    if a.shape != b.shape:
+        raise ValueError(f"Shape mismatch: {a.shape} vs {b.shape}")
+
+    # Normalize both images
+    a_norm = normalize_image(a)
+    b_norm = normalize_image(b)
+
+    h, w = a.shape
+
+    yy, xx = np.indices((h, w))
+    mask = ((yy // tile_size + xx // tile_size) % 2).astype(bool)
+
+    out = np.where(mask, a_norm, b_norm)
+    return out
+
+
+# Precheck: visualize sampled mri on histology space
+def plot_mri_on_histology(mri_on_histo, Ih_hr, Mh_hr, tile_size=384, save_file=None, save_file_single=None):
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+    axes = axes.ravel()
+
+    arr_Ih_hr = sitk.GetArrayFromImage(Ih_hr)[0]
+    arr_Mh_hr = sitk.GetArrayFromImage(Mh_hr)[0]
+
+    hist_disp = np.flipud(arr_Ih_hr).astype(np.float32)
+    mri_disp  = np.flipud(mri_on_histo).astype(np.float32)
+    mask_disp = np.flipud(arr_Mh_hr).astype(np.float32)
+
+    # keep same behavior as final-check style, but in histology support
+    hist_disp = hist_disp * mask_disp
+    mri_disp  = mri_disp * mask_disp
+
+    mask_src = None
+    mask_ref = None
+    h01, _ = robust01(hist_disp, mask=mask_src, pclip=(1, 99))
+    mri_lut, _ = robust01(mri_disp, mask=mask_ref, pclip=(1, 99))
+
+    xq, yq = make_monotone_lut(
+        src01=h01, ref01=mri_lut,
+        src_mask=mask_src, ref_mask=mask_ref,
+        n_quant=2048
+    )
+    histo_lut = apply_lut_monotone(h01, xq, yq)
+
+    hist_norm = hist_disp
+    mri_norm  = mri_disp
+
+    axes[0].imshow(hist_norm, cmap='gray')
+    axes[0].set_title("Histology on histology space")
+
+    axes[1].imshow(mri_norm, cmap='gray')
+    axes[1].set_title("MRI on histology space")
+
+    checker = make_checkerboard(hist_norm, mri_norm, tile_size=tile_size)
+    axes[2].imshow(checker, cmap='gray')
+    axes[2].set_title(f"Checkerboard (tile={tile_size})")
+
+    axes[3].imshow(histo_lut, cmap='gray')
+    axes[3].set_title("Histology on histology space")
+
+    axes[4].imshow(mri_lut, cmap='gray')
+    axes[4].set_title("MRI on histology space")
+
+    checker_lut = make_checkerboard(histo_lut, mri_lut, tile_size=tile_size)
+    axes[5].imshow(checker_lut, cmap='gray')
+    axes[5].set_title(f"Checkerboard (tile={tile_size})")
+
+    plt.tight_layout()
+
+    if save_file is not None:
+        os.makedirs(os.path.dirname(save_file), exist_ok=True)
+        fig.savefig(save_file, dpi=300, bbox_inches="tight")
+        print(f"Saved figure to: {save_file}")
+
+    plt.show()
+
+    if save_file_single is not None:
+        os.makedirs(os.path.dirname(save_file_single), exist_ok=True)
+        fig2, ax2 = plt.subplots(figsize=(6, 6))
+        ax2.imshow(mri_disp, cmap='gray')
+        ax2.set_title("MRI on histology space")
+        ax2.axis("on")
+        fig2.tight_layout()
+        fig2.savefig(save_file_single, dpi=300, bbox_inches="tight")
+        plt.close(fig2)
+        print(f"Saved image to: {save_file_single}")
+
+
+def plot_mri_on_histology_rgb(
+    arr_Ih_hr,
+    arr_Ih_rgb_hr,
+    mri_clean,
+    arr_Mh_hr=None,
+    tile=384,
+    pclip=(1, 99),
+    n_quant=2048,
+    save_file=None,
+    flip_display=False,
+):
+    def _to_np(x):
+        if isinstance(x, sitk.Image):
+            return sitk.GetArrayFromImage(x)
+        return np.asarray(x)
+
+    def to_gray2d(a, name):
+        a = _to_np(a)
+        if a.ndim == 2:
+            return a.astype(np.float32)
+        if a.ndim == 3 and a.shape[0] == 1:
+            return a[0].astype(np.float32)
+        if a.ndim == 3 and a.shape[-1] == 1:
+            return a[..., 0].astype(np.float32)
+        raise ValueError(f"{name} must be 2D grayscale (or singleton 3D), got {a.shape}")
+
+    def to_rgb3(a, name):
+        a = _to_np(a)
+        if a.ndim == 3 and a.shape[-1] == 3:
+            return a.astype(np.float32)
+        raise ValueError(f"{name} must be RGB with shape (H,W,3), got {a.shape}")
+
+    hist_gray = to_gray2d(arr_Ih_hr, "arr_Ih_hr")
+    hist_rgb  = to_rgb3(arr_Ih_rgb_hr, "arr_Ih_rgb_hr")
+    mri_gray  = to_gray2d(mri_clean, "mri_clean")
+
+    if hist_gray.shape != mri_gray.shape:
+        raise ValueError(f"Shape mismatch: hist_gray {hist_gray.shape} vs mri_gray {mri_gray.shape}")
+    if hist_rgb.shape[:2] != hist_gray.shape:
+        raise ValueError(f"Shape mismatch: hist_rgb {hist_rgb.shape} vs hist_gray {hist_gray.shape}")
+
+    mask = None
+    if arr_Mh_hr is not None:
+        mask = (to_gray2d(arr_Mh_hr, "arr_Mh_hr") > 0)
+        if mask.shape != hist_gray.shape:
+            raise ValueError(f"Mask shape mismatch: {mask.shape} vs {hist_gray.shape}")
+
+    if mask is not None:
+        hist_gray = hist_gray * mask
+        mri_gray  = mri_gray * mask
+        hist_rgb  = hist_rgb * mask[..., None]
+
+    h01, _ = robust01(hist_gray, mask=mask, pclip=pclip)
+    m01, _ = robust01(mri_gray,  mask=mask, pclip=pclip)
+
+    xq, yq = make_monotone_lut(
+        src01=h01, ref01=m01,
+        src_mask=mask, ref_mask=mask,
+        n_quant=n_quant
+    )
+    histo_lut = apply_lut_monotone(h01, xq, yq)
+
+    rgb = hist_rgb.copy()
+    if rgb.max() > 1.0:
+        rgb /= 255.0
+
+    mri_rgb = np.repeat(m01[..., None], 3, axis=-1)
+
+    yy, xx = np.indices(h01.shape)
+    cb = ((yy // int(tile) + xx // int(tile)) % 2 == 0)
+
+    checker_lut = np.where(cb, histo_lut, m01)
+    checker_rgb = np.where(cb[..., None], rgb, mri_rgb)
+
+    if mask is not None:
+        histo_lut_disp   = np.where(mask, histo_lut, 1.0)
+        m01_disp         = np.where(mask, m01, 1.0)
+        checker_lut_disp = np.where(mask, checker_lut, 1.0)
+        rgb_disp         = np.where(mask[..., None], rgb, 1.0)
+        checker_rgb_disp = np.where(mask[..., None], checker_rgb, 1.0)
+        mask_disp        = mask.astype(np.float32)
+    else:
+        histo_lut_disp   = histo_lut
+        m01_disp         = m01
+        checker_lut_disp = checker_lut
+        rgb_disp         = rgb
+        checker_rgb_disp = checker_rgb
+        mask_disp        = np.ones_like(h01, dtype=np.float32)
+
+    if flip_display:
+        histo_lut_disp   = np.flipud(histo_lut_disp)
+        m01_disp         = np.flipud(m01_disp)
+        checker_lut_disp = np.flipud(checker_lut_disp)
+        rgb_disp         = np.flipud(rgb_disp)
+        checker_rgb_disp = np.flipud(checker_rgb_disp)
+        mask_disp        = np.flipud(mask_disp)
+
+    fig, ax = plt.subplots(2, 3, figsize=(20, 14))
+
+    ax[0, 0].imshow(histo_lut_disp, cmap="gray", origin="lower")
+    ax[0, 0].set_title("Histology (LUT -> MRI)")
+    ax[0, 1].imshow(m01_disp, cmap="gray", origin="lower")
+    ax[0, 1].set_title("MRI (robust01)")
+    ax[0, 2].imshow(checker_lut_disp, cmap="gray", origin="lower")
+    ax[0, 2].set_title(f"Checkerboard LUT (tile={tile})")
+
+    ax[1, 0].imshow(rgb_disp, origin="lower")
+    ax[1, 0].set_title("RGB Histo")
+    ax[1, 1].imshow(m01_disp, cmap="gray", origin="lower")
+    ax[1, 1].set_title("MRI on Histo")
+    ax[1, 2].imshow(checker_rgb_disp, origin="lower")
+    ax[1, 2].set_title(f"Checkerboard RGB (tile={tile})")
+
+    for a in ax.ravel():
+        a.axis("off")
+
+    fig.tight_layout()
+
+    if save_file is not None:
+        d = os.path.dirname(save_file)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        fig.savefig(save_file, dpi=300, bbox_inches="tight")
+        print(f"Saved: {save_file}")
+
+    plt.show()
+    plt.close(fig)
+
+
+def _plot_surface(z_tensor, title, save_file=None):
+    z = z_tensor.detach().cpu().numpy()          # (H, W)
+    ys, xs = np.mgrid[0:z.shape[0], 0:z.shape[1]]
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # light red fill, no colormap; thin red wire for shape
+    surf = ax.plot_surface(
+        xs, ys, z,
+        color=(0.95, 0.45, 0.45, 0.35),  # RGBA (soft red, 35% opaque)
+        edgecolor=(0.82, 0.20, 0.20, 0.6),
+        linewidth=0.3,
+        antialiased=True
+    )
+
+    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+    ax.set_title(title)
+    plt.tight_layout()
+
+    # Save figure
+    if save_file is not None:
+        os.makedirs(os.path.dirname(save_file), exist_ok=True)
+        fig.savefig(save_file, dpi=300, bbox_inches="tight")
+        print(f"Saved figure to: {save_file}")
+
+    plt.show()
+
