@@ -39,11 +39,9 @@ def resample_histo_to_mri(Ih_hr, Mh_hr, Im):
         int(np.ceil(hist_size[i] * (hist_spacing[i] / mri_spacing[i])))
         for i in range(3)
     ]
-    # print("New size for histology:", hist_size_new)
 
     # For moving mri back to high resolution histology space
     A_hr_to_lr = voxel_index_affine_hr_to_lr(hist_spacing, mri_spacing)
-    # print("Voxel-index affine HR->LR (4x4):\n", A_hr_to_lr)
 
     # Resample histology to MRI spacing
     resampler = sitk.ResampleImageFilter()
@@ -200,9 +198,6 @@ def pad_xy_to_patch_multiple(img, patch_size, constant=0):
     target = size.copy()
     target[0] = int(np.ceil(size[0] / patch_size) * patch_size)
     target[1] = int(np.ceil(size[1] / patch_size) * patch_size)
-    # max_target = max(target[0],target[1])
-    # target[0] = max_target
-    # target[1] = max_target
     target[2] = size[2]
 
     pad_total = target - size
@@ -267,8 +262,8 @@ def show_proc_image(img, mask, title, idx=0, save_file=None):
 
     # Save figure
     if save_file is not None:
-        os.makedirs(os.path.dirname(save_file), exist_ok=True)        
-        
+        os.makedirs(os.path.dirname(save_file), exist_ok=True)
+
         fig2, ax2 = plt.subplots(figsize=(6, 6))
         ax2.imshow(np.flipud(arr_img), cmap='gray')
         ax2.set_title(f"Processed {title}")
@@ -296,9 +291,8 @@ def prepare_histo_regis(Ih, Mh, scale_ratio, patch_size, show_proc_img=False, sa
     # 3) LR->proc affine in voxel space (matches steps 1+2)
     A_lr_to_proc = affine_lr_to_proc_voxel(Ih, scaled_size, pad_lower)
 
-    # proc_Ih = robust_intensity_prep(pad_Ih, proc_Mh)
     proc_Ih = pad_Ih
-    
+
     if show_proc_img:
         show_proc_image(proc_Ih, proc_Mh, title="Histo", idx=0, save_file=save_file)
 
@@ -332,8 +326,7 @@ def prepare_mri_slab(Im, Mm, n_slices, show_proc_img=False, save_file=None, pcli
 
     slab_Mm = dilate_mask(Mm, ball_size=1)
     slab_raw_Im = Im
-    slab_Im = robust_intensity_prep(Im, slab_Mm, pclip=pclip)    
-    # slab_Im = Im
+    slab_Im = robust_intensity_prep(Im, slab_Mm, pclip=pclip)
 
     if show_proc_img:
         show_proc_image(slab_Im, slab_Mm, idx=n_slices, title="MRI", save_file=save_file)

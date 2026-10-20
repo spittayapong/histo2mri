@@ -9,9 +9,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utilities import sample_mri_cubic_3d, sample_mri_cubic_3d_tiled
+from utilities import sample_mri_cubic_3d
 from pose_estimation_v6 import ThinPlateSplineSurface3D, _tps_residuals, _fit_tps_on_subset
-from refinement_v7 import _prepare_data_tensor, BSplineResidualSurface3D, combined_masked_ssim_ngf_loss, _upsample_ctrl, _copy_ctrl, ScalarNormalOffsetField, bending_energy, sheet_inside_volume_penalty, _plot_surface, sample_mri_on_sheet, BSplineFFD2D, bending_energy_2d
+from refinement_v7 import _prepare_data_tensor, BSplineResidualSurface3D, _upsample_ctrl, _copy_ctrl, ScalarNormalOffsetField, bending_energy, sheet_inside_volume_penalty, _plot_surface, sample_mri_on_sheet, BSplineFFD2D, bending_energy_2d
 
 # ============================================================
 # v12 = v11 + LOCAL RIGIDITY.
@@ -227,7 +227,6 @@ def fit_G_plane_canvas_from_matches(
         else:
             inlier_mask = best_inl
     else:
-        # A2, t_xy = _affine_2d(P_local, U_xy)
         A2, t_xy = _fit_similarity(P_local, U_xy)
         inlier_mask = np.ones(N, dtype=bool)
 
@@ -275,70 +274,6 @@ def fit_G_plane_canvas_from_matches(
     }
     return G
 
-@torch.no_grad()
-def resample_mri_on_G(
-    mri_vol,
-    G,
-    device="cuda:0",
-    kernel="catmull-rom",
-    padding_mode="zeros",
-    use_tiled=False,
-    tile_hw=512,
-    canvas_shape=None,          # None -> return local plane image; (Hc,Wc) -> place on canvas
-    common_shift_yx=None,       # used only when canvas_shape is given
-):
-    vol = sitk.GetArrayFromImage(mri_vol).astype(np.float32) if isinstance(mri_vol, sitk.Image) else np.asarray(mri_vol, np.float32)
-    if vol.ndim == 2:
-        vol = vol[None, ...]
-    Z, Y, X = vol.shape
-
-    X0 = np.asarray(G["X0"], np.float32)
-    e1 = np.asarray(G["e1"], np.float32)
-    e2 = np.asarray(G["e2"], np.float32)
-    x0, x1 = map(float, G["x_range"])
-    y0, y1 = map(float, G["y_range"])
-    step = float(G.get("plane_step", 1.0))
-
-    xs = np.arange(x0, x1 + 1e-6, step, dtype=np.float32)
-    ys = np.arange(y0, y1 + 1e-6, step, dtype=np.float32)
-    Wm, Hm = len(xs), len(ys)
-
-    if canvas_shape is None:
-        # local plane image
-        uu, vv = np.meshgrid(xs, ys)  # local plane coords
-        in_plane = np.ones_like(uu, dtype=bool)
-    else:
-        # place local plane on common canvas
-        Hc, Wc = int(canvas_shape[0]), int(canvas_shape[1])
-        if common_shift_yx is None:
-            oy = (Hc - Hm) // 2
-            ox = (Wc - Wm) // 2
-        else:
-            oy, ox = int(common_shift_yx[0]), int(common_shift_yx[1])
-
-        yy, xx = np.meshgrid(np.arange(Hc, dtype=np.float32), np.arange(Wc, dtype=np.float32), indexing="ij")
-        uu = (xx - ox) * step + x0
-        vv = (yy - oy) * step + y0
-        in_plane = (uu >= x0) & (uu <= x1) & (vv >= y0) & (vv <= y1)
-
-    # IMPORTANT: no extra x0/y0 shift here (already encoded in X0)
-    XYZ = X0[None, None, :] + uu[..., None] * e1[None, None, :] + vv[..., None] * e2[None, None, :]
-
-    Xv, Yv, Zv = XYZ[..., 0], XYZ[..., 1], XYZ[..., 2]
-    valid = in_plane & (Xv >= 0) & (Xv <= X - 1) & (Yv >= 0) & (Yv <= Y - 1) & (Zv >= 0) & (Zv <= Z - 1)
-
-    vol_t = torch.from_numpy(vol).to(device)[None, None]
-    P_t = torch.from_numpy(XYZ.astype(np.float32)).to(device)
-
-    if use_tiled:
-        out = sample_mri_cubic_3d_tiled(vol_t, P_t, tile_hw=tile_hw, kernel=kernel, padding_mode=padding_mode)
-    else:
-        out = sample_mri_cubic_3d(vol_t, P_t, kernel=kernel, padding_mode=padding_mode)
-
-    mri = out[0, 0].detach().cpu().numpy()
-    if padding_mode.lower() == "zeros":
-        mri[~valid] = 0.0
-    return mri
 
 def find_clean_matches_common(clean_matches, oy_h, ox_h):
     clean_matches_common = []
@@ -360,249 +295,6 @@ def find_clean_matches_common(clean_matches, oy_h, ox_h):
         clean_matches_common.append(mm)
 
     return clean_matches_common
-
-@torch.no_grad()
-def resample_histology_on_G(
-    hist_img,                   # 2D np or sitk (1,H,W)/(H,W)
-    G,
-    device="cuda:0",
-    canvas_shape=None,          # None -> local uv image, (Hc,Wc) -> common canvas
-    common_shift_yx=None,       # optional; if None and canvas, use G["canvas_offset_yx"] if exists
-    fill_invalid=0.0,
-    return_extra=False,         # True -> (hist_out, valid, uv_hw2, xy_hw2)
-):
-    # hist -> 2D
-    if isinstance(hist_img, sitk.Image):
-        h = sitk.GetArrayFromImage(hist_img)
-        if h.ndim == 3 and h.shape[0] == 1:
-            h = h[0]
-    else:
-        h = np.asarray(hist_img)
-    if h.ndim != 2:
-        raise ValueError(f"hist_img must be 2D, got {h.shape}")
-    h = h.astype(np.float32)
-    Hh, Wh = h.shape
-
-    # uv range from G
-    u0, u1 = map(float, G["x_range"])
-    v0, v1 = map(float, G["y_range"])
-    step = float(G.get("plane_step", 1.0))
-
-    us = np.arange(u0, u1 + 1e-6, step, dtype=np.float32)
-    vs = np.arange(v0, v1 + 1e-6, step, dtype=np.float32)
-    Wm, Hm = len(us), len(vs)
-
-    # build uv grid
-    if canvas_shape is None:
-        uu, vv = np.meshgrid(us, vs)  # local
-        in_uv = np.ones_like(uu, dtype=bool)
-    else:
-        Hc, Wc = int(canvas_shape[0]), int(canvas_shape[1])
-        if common_shift_yx is None:
-            if "canvas_offset_yx" in G:
-                oy, ox = map(int, G["canvas_offset_yx"])
-            else:
-                oy = (Hc - Hm) // 2
-                ox = (Wc - Wm) // 2
-        else:
-            oy, ox = int(common_shift_yx[0]), int(common_shift_yx[1])
-
-        yy, xx = np.meshgrid(
-            np.arange(Hc, dtype=np.float32),
-            np.arange(Wc, dtype=np.float32),
-            indexing="ij"
-        )
-        uu = (xx - ox) * step + u0
-        vv = (yy - oy) * step + v0
-        in_uv = (uu >= u0) & (uu <= u1) & (vv >= v0) & (vv <= v1)
-
-    Hout, Wout = uu.shape
-    uv_flat = np.stack([uu, vv], axis=-1).reshape(-1, 2).astype(np.float32)
-
-    # uv -> hist(x,y) via G forward map
-    t = np.asarray(G["t_xy"], dtype=np.float32)
-    if "A2" in G:
-        A2 = np.asarray(G["A2"], dtype=np.float32)
-        xy = uv_flat @ A2.T + t[None, :]
-    elif "A2_invT" in G:
-        A2 = np.linalg.inv(np.asarray(G["A2_invT"], dtype=np.float32)).T
-        xy = uv_flat @ A2.T + t[None, :]
-    elif ("s" in G) and ("R2" in G):
-        s = float(G["s"])
-        R2 = np.asarray(G["R2"], dtype=np.float32)
-        xy = s * (uv_flat @ R2.T) + t[None, :]
-    else:
-        raise KeyError("G needs A2 (or A2_invT) or (s,R2), plus t_xy.")
-
-    xh = xy[:, 0].reshape(Hout, Wout)
-    yh = xy[:, 1].reshape(Hout, Wout)
-
-    valid_hist = (xh >= 0) & (xh <= Wh - 1) & (yh >= 0) & (yh <= Hh - 1)
-    valid = in_uv & valid_hist
-
-    # bilinear sample hist
-    hist_t = torch.from_numpy(h).to(device=device)[None, None]  # (1,1,H,W)
-    xn = 2.0 * (xh / max(Wh - 1, 1)) - 1.0
-    yn = 2.0 * (yh / max(Hh - 1, 1)) - 1.0
-    grid = np.stack([xn, yn], axis=-1).astype(np.float32)
-    grid_t = torch.from_numpy(grid).to(device=device)[None]      # (1,Hout,Wout,2)
-
-    out = F.grid_sample(hist_t, grid_t, mode="bilinear", padding_mode="zeros", align_corners=True)
-    hist_out = out[0, 0].detach().cpu().numpy()
-
-    if fill_invalid is not None:
-        hist_out = hist_out.copy()
-        hist_out[~valid] = float(fill_invalid)
-
-    if return_extra:
-        return hist_out, valid, uv_flat.reshape(Hout, Wout, 2), xy.reshape(Hout, Wout, 2)
-    return hist_out
-
-def check_mri_on_init_G_common_canvas(
-    slab_Im=None,
-    proc_Ih=None,
-    G=None,
-    mri_on_init_G=None,           # precomputed MRI-on-G (optional)
-    hist_on_init_G=None,          # precomputed Hist-on-G (optional)
-    img_size=None,                # backward compatibility
-    save_file=None,
-    device="cuda:0",
-    canvas_shape=None,            # (H,W)
-    common_shift_yx=None,
-    kernel="catmull-rom",
-    padding_mode="zeros",
-    flip_display=False,
-    show_checker=True,
-    checker_tile=24,
-):
-    import os
-    import numpy as np
-    import matplotlib.pyplot as plt
-    import SimpleITK as sitk
-
-    def _to_2d(img):
-        if isinstance(img, sitk.Image):
-            arr = sitk.GetArrayFromImage(img)
-        else:
-            arr = np.asarray(img)
-        arr = np.asarray(arr)
-        if arr.ndim == 3 and arr.shape[0] == 1:
-            arr = arr[0]
-        if arr.ndim != 2:
-            raise ValueError(f"Expected 2D image, got shape={arr.shape}")
-        return arr.astype(np.float32)
-
-    def _norm01(a, eps=1e-8):
-        a = a.astype(np.float32)
-        mn, mx = a.min(), a.max()
-        if mx <= mn + eps:
-            return np.zeros_like(a, dtype=np.float32)
-        return (a - mn) / (mx - mn + eps)
-
-    def _checker(a, b, valid, tile=24):
-        a = _norm01(a)
-        b = _norm01(b)
-        h, w = a.shape
-        yy, xx = np.indices((h, w))
-        m = ((yy // tile + xx // tile) % 2).astype(bool)
-        out = np.where(m, a, b)
-        out[~valid] = 0.0
-        return out
-
-    # infer target shape if needed
-    target_shape = None
-    if canvas_shape is not None:
-        target_shape = (int(canvas_shape[0]), int(canvas_shape[1]))
-    elif mri_on_init_G is not None:
-        target_shape = _to_2d(mri_on_init_G).shape
-    elif hist_on_init_G is not None:
-        target_shape = _to_2d(hist_on_init_G).shape
-    elif img_size is not None:
-        target_shape = (int(img_size[0]), int(img_size[1]))
-
-    # 1) MRI on G
-    if mri_on_init_G is not None:
-        mri_np = _to_2d(mri_on_init_G)
-        valid_mri = np.ones_like(mri_np, dtype=bool)
-    else:
-        if slab_Im is None or G is None:
-            raise ValueError("Need either precomputed mri_on_init_G OR both slab_Im and G.")
-        out = resample_mri_on_G(
-            mri_vol=slab_Im,
-            G=G,
-            device=device,
-            kernel=kernel,
-            padding_mode=padding_mode,
-            canvas_shape=target_shape,
-            common_shift_yx=common_shift_yx,
-        )
-        if isinstance(out, tuple):
-            mri_np = out[0]
-            valid_mri = out[1] if len(out) > 1 and out[1] is not None else np.ones_like(mri_np, dtype=bool)
-        else:
-            mri_np = out
-            valid_mri = np.ones_like(mri_np, dtype=bool)
-
-    # 2) Hist on G
-    if hist_on_init_G is not None:
-        hist_np = _to_2d(hist_on_init_G)
-        valid_hist = np.ones_like(hist_np, dtype=bool)
-    else:
-        if proc_Ih is None or G is None:
-            raise ValueError("Need either precomputed hist_on_init_G OR both proc_Ih and G.")
-        h_out = resample_histology_on_G(
-            hist_img=proc_Ih,
-            G=G,
-            device=device,
-            canvas_shape=mri_np.shape,
-            common_shift_yx=common_shift_yx,
-            fill_invalid=0.0,
-            return_extra=True,
-        )
-        hist_np, valid_hist = h_out[0], h_out[1]
-
-    if hist_np.shape != mri_np.shape:
-        raise ValueError(f"Shape mismatch: hist {hist_np.shape} vs mri {mri_np.shape}")
-
-    valid = valid_mri & valid_hist
-
-    hist_disp = hist_np.copy()
-    mri_disp = mri_np.copy()
-    hist_disp[~valid] = 0.0
-    mri_disp[~valid] = 0.0
-
-    if flip_display:
-        hist_disp = np.flipud(hist_disp)
-        mri_disp = np.flipud(mri_disp)
-        valid = np.flipud(valid)
-
-    ncols = 3 if show_checker else 2
-    fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 6))
-    axes[0].imshow(hist_disp, cmap="gray", origin="lower")
-    axes[0].set_title("Histology on Init G")
-    axes[1].imshow(mri_disp, cmap="gray", origin="lower")
-    axes[1].set_title("MRI on Init G")
-    if show_checker:
-        axes[2].imshow(_checker(hist_disp, mri_disp, valid, tile=checker_tile), cmap="gray", origin="lower")
-        axes[2].set_title("Checkerboard")
-    for ax in axes:
-        ax.axis("off")
-    plt.tight_layout()
-    plt.show()
-
-    if save_file is not None:
-        os.makedirs(os.path.dirname(save_file), exist_ok=True)
-        fig2, ax2 = plt.subplots(figsize=(6, 6))
-        # ax2.imshow(_checker(hist_disp, mri_disp, valid, tile=checker_tile), cmap="gray", origin="lower")
-        ax2.imshow(mri_disp, cmap="gray", origin="lower")
-        ax2.set_title("Checkerboard: Hist vs MRI on Init G")
-        ax2.axis("off")
-        fig2.tight_layout()
-        fig2.savefig(save_file, dpi=300, bbox_inches="tight")
-        plt.close(fig2)
-        print(f"Saved image to: {save_file}")
-
-    return mri_disp, hist_disp, valid
 
 
 # Init DDF
@@ -850,80 +542,6 @@ def fit_residual_tps2d_with_G_anchors(
         normalize_uv=normalize_uv,
     ).to(device)
     return tps2d_res, uv_all, dxy_all, uv_anchor
-
-@torch.no_grad()
-def resample_mri_on_G_residual_tps(
-    mri_vol,
-    G,
-    tps3d_residual,
-    ctrl_uv,
-    device="cuda:0",
-    kernel="catmull-rom",
-    padding_mode="zeros",
-    canvas_shape=None,
-    common_shift_yx=None,
-    fill_invalid=0.0,
-    sigma_uv=20.0,
-    min_conf=0.25,
-    hard_mult=2.0,
-    max_residual_vox=16.0,
-    return_extra=False,
-):
-    vol = sitk.GetArrayFromImage(mri_vol).astype(np.float32) if isinstance(mri_vol, sitk.Image) else np.asarray(mri_vol, np.float32)
-    if vol.ndim == 2:
-        vol = vol[None, ...]
-    Z, Y, X = vol.shape
-
-    u0, u1 = map(float, G["x_range"])
-    v0, v1 = map(float, G["y_range"])
-    step = float(G.get("plane_step", 1.0))
-
-    us = np.arange(u0, u1 + 1e-6, step, dtype=np.float32)
-    vs = np.arange(v0, v1 + 1e-6, step, dtype=np.float32)
-    Wm, Hm = len(us), len(vs)
-
-    if canvas_shape is None:
-        uu, vv = np.meshgrid(us, vs)
-        in_uv = np.ones_like(uu, dtype=bool)
-    else:
-        Hc, Wc = int(canvas_shape[0]), int(canvas_shape[1])
-        if common_shift_yx is None:
-            oy = (Hc - Hm) // 2
-            ox = (Wc - Wm) // 2
-        else:
-            oy, ox = int(common_shift_yx[0]), int(common_shift_yx[1])
-        yy, xx = np.meshgrid(np.arange(Hc, dtype=np.float32), np.arange(Wc, dtype=np.float32), indexing="ij")
-        uu = (xx - ox) * step + u0
-        vv = (yy - oy) * step + v0
-        in_uv = (uu >= u0) & (uu <= u1) & (vv >= v0) & (vv <= v1)
-
-    Hout, Wout = uu.shape
-    uv_flat = np.stack([uu, vv], axis=-1).reshape(-1, 2).astype(np.float32)
-
-    xyz_g = xyz_from_G_uv(uv_flat, G).reshape(Hout, Wout, 3)
-    dxyz = tps3d_residual(torch.from_numpy(uv_flat).to(device)).detach().cpu().numpy().reshape(Hout, Wout, 3)
-
-    dn = np.linalg.norm(dxyz, axis=-1, keepdims=True) + 1e-8
-    dxyz = dxyz * np.minimum(1.0, float(max_residual_vox) / dn)
-
-    conf, dmin = uv_support_confidence(uv_flat, ctrl_uv, Hout, Wout, sigma_uv=sigma_uv, min_conf=min_conf, hard_mult=hard_mult)
-    xyz = xyz_g + conf[..., None] * dxyz
-
-    Xv, Yv, Zv = xyz[..., 0], xyz[..., 1], xyz[..., 2]
-    valid = in_uv & (Xv >= 0) & (Xv <= X - 1) & (Yv >= 0) & (Yv <= Y - 1) & (Zv >= 0) & (Zv <= Z - 1)
-
-    vol_t = torch.from_numpy(vol).to(device)[None, None]
-    P_t = torch.from_numpy(xyz.astype(np.float32)).to(device)
-    out = sample_mri_cubic_3d(vol_t, P_t, kernel=kernel, padding_mode=padding_mode)
-    mri_out = out[0, 0].detach().cpu().numpy()
-
-    if fill_invalid is not None:
-        mri_out = mri_out.copy()
-        mri_out[~valid] = float(fill_invalid)
-
-    if return_extra:
-        return mri_out, valid, xyz, conf, dmin
-    return mri_out
 
 
 @torch.no_grad()
@@ -1227,191 +845,6 @@ def build_G_anchors_uv_xyz(
     xyz_anchor = X0[None, :] + uv_anchor[:, 0:1] * e1[None, :] + uv_anchor[:, 1:2] * e2[None, :]
 
     return uv_anchor.astype(np.float32), xyz_anchor.astype(np.float32)
-
-
-@torch.no_grad()
-def resample_mri_on_G_tps(
-    mri_vol,
-    G,
-    tps3d_module,                 # fitted TPS: uv -> xyz(voxel)
-    device="cuda:0",
-    kernel="catmull-rom",
-    padding_mode="zeros",
-    use_tiled=False,
-    tile_hw=512,
-    canvas_shape=None,            # None -> local uv image, (Hc,Wc) -> common canvas image
-    common_shift_yx=None,         # (oy,ox), used only when canvas_shape is not None
-    fill_invalid=0.0,
-    return_extra=False,           # True -> return (mri, valid, xyz, uu, vv)
-):
-    """
-    Curved-sheet MRI resampling on TPS surface using G's uv range/step.
-    Requires G keys: x_range, y_range, plane_step.
-    """
-    # --- volume to [Z,Y,X] numpy ---
-    if isinstance(mri_vol, torch.Tensor):
-        v = mri_vol.detach().cpu()
-        if v.ndim == 5:      # (1,1,Z,Y,X)
-            vol = v[0, 0].numpy().astype(np.float32)
-        elif v.ndim == 3:    # (Z,Y,X)
-            vol = v.numpy().astype(np.float32)
-        else:
-            raise ValueError(f"Unsupported torch mri_vol shape: {tuple(v.shape)}")
-    else:
-        vol = sitk.GetArrayFromImage(mri_vol).astype(np.float32) if isinstance(mri_vol, sitk.Image) else np.asarray(mri_vol, dtype=np.float32)
-        if vol.ndim == 2:
-            vol = vol[None, ...]
-
-    Z, Y, X = vol.shape
-
-    # --- uv range from G ---
-    u0, u1 = map(float, G["x_range"])
-    v0, v1 = map(float, G["y_range"])
-    step = float(G.get("plane_step", 1.0))
-
-    us = np.arange(u0, u1 + 1e-6, step, dtype=np.float32)
-    vs = np.arange(v0, v1 + 1e-6, step, dtype=np.float32)
-    Wm, Hm = len(us), len(vs)
-
-    # --- build uv grid (local or canvas-mapped) ---
-    if canvas_shape is None:
-        uu, vv = np.meshgrid(us, vs)  # local uv image
-        in_uv = np.ones_like(uu, dtype=bool)
-    else:
-        Hc, Wc = int(canvas_shape[0]), int(canvas_shape[1])
-
-        if common_shift_yx is None:
-            oy = (Hc - Hm) // 2
-            ox = (Wc - Wm) // 2
-        else:
-            oy, ox = int(common_shift_yx[0]), int(common_shift_yx[1])
-
-        yy_c, xx_c = np.meshgrid(
-            np.arange(Hc, dtype=np.float32),
-            np.arange(Wc, dtype=np.float32),
-            indexing="ij"
-        )
-
-        # canvas pixel -> uv coords
-        uu = (xx_c - ox) * step + u0
-        vv = (yy_c - oy) * step + v0
-        in_uv = (uu >= u0) & (uu <= u1) & (vv >= v0) & (vv <= v1)
-
-    Hout, Wout = uu.shape
-
-    # --- TPS eval: uv -> xyz(voxel) ---
-    uv_flat = np.stack([uu, vv], axis=-1).reshape(-1, 2)
-    uv_t = torch.as_tensor(uv_flat, dtype=torch.float32, device=device)
-    xyz_t = tps3d_module(uv_t).reshape(Hout, Wout, 3).to(torch.float32)  # xyz voxel
-    xyz_np = xyz_t.detach().cpu().numpy()
-
-    Xv, Yv, Zv = xyz_np[..., 0], xyz_np[..., 1], xyz_np[..., 2]
-    valid = in_uv & (Xv >= 0) & (Xv <= X - 1) & (Yv >= 0) & (Yv <= Y - 1) & (Zv >= 0) & (Zv <= Z - 1)
-
-    # --- cubic sampling ---
-    vol_t = torch.from_numpy(vol).to(device=device)[None, None]  # (1,1,Z,Y,X)
-
-    if use_tiled:
-        out = sample_mri_cubic_3d_tiled(
-            vol_1_1_zyx=vol_t,
-            P_vox_xyz=xyz_t,
-            tile_hw=tile_hw,
-            kernel=kernel,
-            padding_mode=padding_mode,
-        )
-    else:
-        out = sample_mri_cubic_3d(
-            vol_1_1_zyx=vol_t,
-            P_vox_xyz=xyz_t,
-            kernel=kernel,
-            padding_mode=padding_mode,
-        )
-
-    mri_out = out[0, 0].detach().cpu().numpy()
-
-    if fill_invalid is not None:
-        mri_out = mri_out.copy()
-        mri_out[~valid] = float(fill_invalid)
-
-    if return_extra:
-        return mri_out, valid, xyz_np, uu, vv
-    return mri_out
-
-def check_mri_on_init_curved_sheet(
-    mri_on_init_tps,
-    hist_on_init_tps,
-    valid=None,                  # optional bool mask, same shape
-    save_file=None,
-    flip_display=False,
-    show_checker=True,
-    checker_tile=24,
-):
-    def _to_2d(x):
-        if isinstance(x, sitk.Image):
-            a = sitk.GetArrayFromImage(x)
-        else:
-            a = np.asarray(x)
-        if a.ndim == 3 and a.shape[0] == 1:
-            a = a[0]
-        if a.ndim != 2:
-            raise ValueError(f"Expected 2D, got {a.shape}")
-        return a.astype(np.float32)
-
-    def _norm01(a, eps=1e-8):
-        mn, mx = float(a.min()), float(a.max())
-        return np.zeros_like(a) if mx <= mn + eps else (a - mn) / (mx - mn + eps)
-
-    def _checker(a, b, m, tile):
-        aa, bb = _norm01(a), _norm01(b)
-        yy, xx = np.indices(a.shape)
-        c = ((yy // tile + xx // tile) % 2).astype(bool)
-        out = np.where(c, aa, bb)
-        out[~m] = 0.0
-        return out
-
-    mri = _to_2d(mri_on_init_tps)
-    hist = _to_2d(hist_on_init_tps)
-    if mri.shape != hist.shape:
-        raise ValueError(f"Shape mismatch: mri {mri.shape} vs hist {hist.shape}")
-
-    if valid is None:
-        valid = np.ones_like(mri, dtype=bool)
-    else:
-        valid = np.asarray(valid, dtype=bool)
-        if valid.shape != mri.shape:
-            raise ValueError(f"valid shape {valid.shape} != image shape {mri.shape}")
-
-
-    mri_disp = mri.copy();   mri_disp[~valid] = 0.0
-    hist_disp = hist.copy(); hist_disp[~valid] = 0.0
-
-    if flip_display:
-        mri_disp = np.flipud(mri_disp)
-        hist_disp = np.flipud(hist_disp)
-        valid = np.flipud(valid)
-
-    ncols = 3 if show_checker else 2
-    fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 6))
-    axes[0].imshow(hist_disp, cmap="gray", origin="lower"); axes[0].set_title("Hist on Init TPS"); axes[0].axis("off")
-    axes[1].imshow(mri_disp, cmap="gray", origin="lower");  axes[1].set_title("MRI on Init TPS");  axes[1].axis("off")
-    if show_checker:
-        axes[2].imshow(_checker(hist_disp, mri_disp, valid, checker_tile), cmap="gray", origin="lower")
-        axes[2].set_title("Checkerboard"); axes[2].axis("off")
-    plt.tight_layout(); plt.show()
-
-    if save_file is not None:
-        os.makedirs(os.path.dirname(save_file), exist_ok=True)
-        fig2, ax2 = plt.subplots(figsize=(6, 6))
-        # ax2.imshow(_checker(hist_disp, mri_disp, valid, tile=checker_tile), cmap="gray", origin="lower")
-        ax2.imshow(mri_disp, cmap="gray", origin="lower")
-        ax2.set_title("Checkerboard: Hist vs MRI on Init TPS")
-        ax2.axis("off")
-        fig2.tight_layout()
-        fig2.savefig(save_file, dpi=300, bbox_inches="tight")
-        plt.close(fig2)
-        print(f"Saved image to: {save_file}")
-
-    return mri_disp, hist_disp, valid
 
 
 # Refinement
@@ -2354,20 +1787,6 @@ def refine_curved_sheet(
             2 * uv_norm_pix[..., 1] - 1.0,
         ], dim=-1).unsqueeze(0)   # (1,H,W,2)
 
-        # levels = [
-        #     dict(gh=12, gw=12, nA=500, lrA=2e-3, lamA=8e-4,
-        #                     nB=500, lrB=2e-3, lamB=2e-3,
-        #                     nF=300, lrF=2e-3, lamF=2e-3,
-        #                     lamSheet=2e-3, lamOut=1e-2),
-        #     dict(gh=24, gw=24, nA=600, lrA=1e-3, lamA=6e-4,
-        #                     nB=600, lrB=1e-3, lamB=1.5e-3,
-        #                     nF=150, lrF=1e-3, lamF=1.5e-3,
-        #                     lamSheet=1.5e-3, lamOut=1e-2),
-        #     dict(gh=32, gw=32, nA=700, lrA=7e-4, lamA=4e-4,
-        #                     nB=700, lrB=7e-4, lamB=1e-3,
-        #                     nF=200, lrF=7e-4, lamF=1e-3,
-        #                     lamSheet=1e-3, lamOut=1e-2),
-        # ]
         _lr = list(lam_rigid_levels) + [lam_rigid_levels[-1]] * 3
         levels = [
             dict(gh=12, gw=12, nA=100, lrA=2e-3, lamA=8e-4,
@@ -2416,7 +1835,7 @@ def refine_curved_sheet(
             mri_on_final_sheet = sample_mri_cubic_3d(
                 mri_t, P_vox_xyz, kernel="catmull-rom", padding_mode="border"
             )[0, 0].detach().cpu().numpy()
-        
+
         if torch.is_tensor(xyz_norm_final):
             valid_mri = (
                 torch.isfinite(xyz_norm_final).all(dim=-1) &
@@ -2432,7 +1851,7 @@ def refine_curved_sheet(
                 (xyz_norm_final[..., 1] >= 0) & (xyz_norm_final[..., 1] <= 1) &
                 (xyz_norm_final[..., 2] >= 0) & (xyz_norm_final[..., 2] <= 1)
             )
-        
+
         valid_out = valid_mri.detach().cpu().numpy()
 
         return xyz_norm_final, mri_on_final_sheet, valid_out, xyz_norm_base, conf, phi_refined, n0, alpha_refined, rf_psi_refined, rf_beta_refined
