@@ -1,4 +1,75 @@
-"""Curved-sheet refinement of the histology surface inside the MRI volume."""
+"""Curved-sheet refinement of the histology section surface inside the MRI volume.
+
+This is the image-driven stage of pipeline.register_section, run after the TPS fit on top
+of the global plane G (tps) and before the mapping back to HR histology (inverse). The
+section is represented as xyz_norm: an (H, W, 3) grid over the common canvas holding MRI
+positions normalised to [0, 1] per axis in (x, y, z) order, so that voxel index =
+xyz_norm * (dim - 1). MRI tensors are indexed (z, y, x). The refinement maximises the
+similarity between the MRI sampled on the sheet and the histology on the common canvas.
+
+Base surface. refine_curved_sheet evaluates the TPS surface on the canvas plane grid,
+clamps its displacement from the G plane and blends it toward G where match support is
+low (confidence conf in [0, 1], 1 near matches, 0 far from them), then adds a B-spline
+residual warm-started from the matches. The result, xyz_norm_base, and its unit normal
+field n0 stay fixed during the refinement.
+
+Refinement fields. Four B-spline fields on the canvas, optimised in turn at each level of
+a coarse-to-fine pyramid (pyramid_refinement):
+
+  phi      2D stationary velocity field. Integrated by scaling and squaring into a
+           displacement that resamples the base surface (and its normal) tangentially,
+           i.e. it slides points within the sheet. Not gated. It changes which base
+           point each canvas pixel maps to; it does not warp the histology image.
+  alpha    Scalar offset along the base normal. Not gated.
+  rf_psi   A second, independent velocity field, multiplied by (1 - conf) before
+           integration and composed after phi.
+  rf_beta  A second scalar normal offset, multiplied by (1 - conf).
+
+rf_psi and rf_beta therefore only add freedom where the base surface has little match
+support and has fallen back toward the flat G plane. Together, a tangential and a normal
+component can represent any 3D displacement, but the tangential part goes through the same
+diffeomorphic integration as phi instead of being a free vector field that could fold the
+sheet.
+
+Why the sheet cannot fold. The flow of a smooth stationary velocity field is a
+diffeomorphism. Scaling and squaring approximates it by dividing the velocity by 2^n,
+which gives a displacement small enough to be invertible, and composing that displacement
+with itself n times. A composition of invertible maps is invertible, so the Jacobian
+determinant stays positive and the sheet does not fold (provided the initial step is small
+compared with the grid spacing).
+
+Why rigidity terms are needed. Not folding is not the same as keeping shape. The B-spline
+bending energy penalises second differences of the control points, and second derivatives
+vanish on any affine field, so a field that locally expands or compresses area costs
+nothing. The sheet can then "melt": exchange area between regions without folding (on a
+real section refined with bending energy alone, the 1st-99th percentiles of the local area
+ratio to the base surface were about 0.38 and 3.47, with no folded pixels).
+
+In the decomposition of Staring, Klein and Pluim (2007, "A rigidity penalty term for
+nonrigid registration"), a transform with Jacobian J is locally rigid when three
+conditions hold: affinity (second derivatives are zero; the bending energy),
+orthonormality (J^T J = I) and properness (det J = 1). The last two are added
+here on the sheet itself rather than on phi's 2D Jacobian, through the first fundamental
+form (E, F, G) of xyz_norm compared with that of xyz_norm_base (E0, F0, G0):
+
+  properness      lam_area  * log(area / area0)^2, with area = sqrt(E*G - F^2). The log
+                  form is symmetric: a 2x expansion and a 2x compression cost the same,
+                  whereas (area/area0 - 1)^2 would under-penalise compression, the
+                  direction in which the sheet melts.
+  orthonormality  lam_shape * ((E-E0)^2 + 2(F-F0)^2 + (G-G0)^2) / area0^2.
+
+Because both terms are computed from xyz_norm, one penalty constrains all four fields
+(alpha has the same blindness as phi: a linear ramp in alpha tilts the sheet at zero
+bending cost). Because they are measured against the base surface, they do not penalise
+the curvature already established by the matches, only what the refinement adds. Both
+are weighted per pixel by losses._build_rigidity_weight. By default lam_area is on and
+lam_shape is off: melting is mostly an exchange of area, and leaving shear free lets the
+real sectioning deformation through.
+
+Units. xyz_norm * (dim - 1) gives voxel-index coordinates. For isotropic voxels this
+differs from physical space by a uniform scale, which cancels in every ratio against the
+base surface, so no voxel spacing is needed. Anisotropic data would need a spacing weight.
+"""
 import numpy as np
 import SimpleITK as sitk
 from scipy.spatial import cKDTree
@@ -19,6 +90,37 @@ def warm_start_residual_ctrl_from_matches(
     device="cuda:0", n_iter=300, lr=1e-2, lam_bend=1e-4,
     hist_key="hist_center_yx", mri_key="mri_center_zyx",
 ):
+    """Fit a 3D B-spline residual so that the TPS surface passes through the matched MRI points.
+
+    For each valid match, the histology position is mapped to plane coordinates (u, v)
+    through the inverse of G's in-plane similarity, (u, v) = A2^-1 (xy - t_xy), and the
+    TPS surface is evaluated there. The target is the MRI match position minus the TPS
+    position, normalised per axis by (dim - 1). The residual is evaluated at the match's
+    histology pixel position normalised by (W - 1, H - 1), and its control points are
+    fitted with Adam on a smooth-L1 loss plus lam_bend * bending_energy. Matches without
+    both keys, or with an MRI position of (-1, -1, -1), are skipped.
+
+    Args:
+        residual: BSplineResidualSurface3D whose control points are optimised in place.
+        init_tps: callable mapping a (N, 2) tensor of plane (u, v) to (N, 3) MRI voxel
+            positions (x, y, z).
+        init_G: global plane dict; uses "t_xy" and "A2_invT".
+        matches: list of match dicts.
+        H: common-canvas height in pixels.
+        W: common-canvas width in pixels.
+        Xdim: MRI slab size along x, in voxels.
+        Ydim: MRI slab size along y, in voxels.
+        Zdim: MRI slab size along z, in voxels.
+        device: torch device string.
+        n_iter: number of Adam iterations.
+        lr: Adam learning rate.
+        lam_bend: weight of the bending energy on the control points.
+        hist_key: match key of the histology position (y, x), in common-canvas pixels.
+        mri_key: match key of the MRI position (z, y, x), in slab voxels.
+
+    Returns:
+        The same `residual` module, with fitted control points.
+    """
     dev = torch.device(device)
 
     # build match tensors
@@ -69,6 +171,7 @@ def warm_start_residual_ctrl_from_matches(
 
 
 def _to_t_1_1_hw(x, device):
+    """Convert a 2D SimpleITK image or array, (H, W) or (1, H, W), to a float32 tensor (1, 1, H, W)."""
     if isinstance(x, sitk.Image):
         a = sitk.GetArrayFromImage(x)
     else:
@@ -88,6 +191,23 @@ def make_soft_dilated_mask(
     min_val=0.0,
     max_val=1.0,
 ):
+    """Dilate a binary mask and soften its edge.
+
+    The mask is thresholded at 0.5, dilated by max pooling and then box-filtered
+    `blur_passes` times. The box filter pads with zeros, so values also fall off within
+    about blur_ks / 2 pixels of the image border.
+
+    Args:
+        mask_t: tensor (1, 1, H, W), boolean or 0/1.
+        dilate_px: dilation radius in pixels.
+        blur_ks: box-filter size in pixels; made odd if even; <= 1 disables blurring.
+        blur_passes: number of box-filter passes (at least 1 when blurring).
+        min_val: lower clamp of the result.
+        max_val: upper clamp of the result.
+
+    Returns:
+        Float tensor (1, 1, H, W) in [min_val, max_val].
+    """
     m = (mask_t > 0.5).float()
 
     # 1) dilate
@@ -108,7 +228,28 @@ def make_soft_dilated_mask(
 
 
 def prepare_coords_from_G_canvas(G, H, W, device, common_shift_yx=None):
-    # UV from same definition as resample_mri_on_G_tps
+    """Compute plane and normalised pixel coordinates for every common-canvas pixel.
+
+    The plane grid is the one G was fitted on: u runs over G["x_range"] and v over
+    G["y_range"] in steps of G["plane_step"]. Canvas pixel (y, x) maps to
+    u = (x - ox) * step + u0 and v = (y - oy) * step + v0. The offset (oy, ox) is
+    `common_shift_yx` if given, else G["canvas_offset_yx"] if present, else the offset
+    that centres the plane grid in the canvas.
+
+    Args:
+        G: global plane dict; uses "x_range", "y_range", optional "plane_step" and
+            optional "canvas_offset_yx".
+        H: canvas height in pixels.
+        W: canvas width in pixels.
+        device: torch device.
+        common_shift_yx: optional (oy, ox) offset of the plane grid in the canvas.
+
+    Returns:
+        Tuple (uv_plane_flat, uv_norm_pix, valid_uv):
+            uv_plane_flat: float tensor (H*W, 2), plane (u, v) per pixel, row-major.
+            uv_norm_pix: float tensor (H, W, 2), (x / (W-1), y / (H-1)) per pixel.
+            valid_uv: bool tensor (H, W), True where (u, v) lies inside G's ranges.
+    """
     u0, u1 = map(float, G["x_range"])
     v0, v1 = map(float, G["y_range"])
     step = float(G.get("plane_step", 1.0))
@@ -148,6 +289,7 @@ def _sheet_frame_like_tps(
     matches_xyz=None, scores=None,
     elev=24, azim=36, alpha=0.9, n_contours=12, cmap="viridis"
 ):
+    """Render the sheet as a 3D surface coloured by depth and return an RGB frame (for the GIF); matches_xyz and scores are not drawn."""
     xyz = xyz_norm.detach().cpu().numpy() if torch.is_tensor(xyz_norm) else np.asarray(xyz_norm)
     Xs = xyz[..., 0] * (Xdim - 1)
     Ys = xyz[..., 1] * (Ydim - 1)
@@ -191,8 +333,8 @@ def pyramid_refinement(
     mri_mask_t,
     hist_t,
     hist_mask_t,
-    xyz_norm_base,       # [H,W,3] FIXED base surface (tps + frozen matches-warm-started residual)
-    n0_base,              # [H,W,3] FIXED unit normal field of xyz_norm_base
+    xyz_norm_base,       # [H,W,3] fixed base surface (TPS + residual warm-started from matches)
+    n0_base,              # [H,W,3] fixed unit normal field of xyz_norm_base
     conf,                 # [H,W] match-support confidence in [0,1] (from _support_conf_from_ctrl_uv)
     uv_norm_pix,
     grid_id_2d,           # identity sampling grid in [-1,1] units, (1,H,W,2)
@@ -206,50 +348,91 @@ def pyramid_refinement(
     base_supersample=32,   # upsample xyz_norm_base/n0_base this many times before phi resamples them
     phi_n_steps=6,          # scaling-and-squaring integration steps for phi's velocity field
     rf_psi_n_steps=6,       # scaling-and-squaring integration steps for rf_psi's velocity field
-    # ---- v12: local rigidity -------------------------------------------------
+    # ---- local rigidity -------------------------------------------------------
     lam_area=1.0,           # properness  : weight on log(area/area0)^2
     lam_shape=0.0,          # orthonormality: weight on ||[[E,F],[F,G]] - base||^2 (OFF by default)
     w_rigid_mode="mask",    # "mask" | "conf" | "edge" | "none"
     rigid_edge_k=2.0,       # only used by w_rigid_mode="edge"
     similarity_weights=(1.0, 0.0, 0.0),   # (w_ssim, w_ngf, w_mind) of the image loss
 ):
-    """
-    v11 refinement: four fields, alternated per pyramid level.
+    """Refine the base sheet with four B-spline fields over a coarse-to-fine pyramid.
 
-      phi     : 2D STATIONARY VELOCITY field, integrated via scaling-and-
-                squaring into a diffeomorphic (non-folding by construction)
-                displacement, then used to RESAMPLE xyz_norm_base
-                tangentially. UNCONDITIONAL -- active everywhere, not gated
-                by confidence.
-      alpha   : scalar offset along the (resampled) surface normal.
-                UNCONDITIONAL, same as phi.
-      rf_psi  : a SECOND, independent 2D stationary velocity field (same
-                mechanism as phi), gated by (1 - conf) and composed ON TOP
-                of phi's already-integrated resample (its own separate
-                scaling-and-squaring integration, then applied via a
-                warp-of-a-warp lookup) -- an extra tangential correction
-                that only matters where phi/alpha's "trust the base
-                surface" assumption breaks down (no local match support,
-                TPS fell back to the flat G-plane there). (NOTE: an
-                earlier diagnostic pass suggested this composition
-                reintroduced ~26% folding vs phi alone -- that turned out
-                to be a measurement bug (torch.autograd.grad through the
-                scaling-and-squaring recursion accumulates numerical error
-                that grows with more steps); verified correct with
-                finite-differences on the converged, no_grad output: 0%
-                folded. Composition is fine.)
-      rf_beta : a SECOND, independent scalar normal offset (same mechanism
-                as alpha), also gated by (1 - conf) -- the extra "lift off
-                the surface" correction in the same low-confidence regions.
+    The sheet is
+        xyz_norm(x) = S(p(x)) + (alpha(x) + g(x) * rf_beta(x)) * N(p(x)),
+        p = (id + d_psi) o (id + d_phi),
+    where S and N are the base surface and its unit normal, g = 1 - conf, d_phi is phi
+    integrated by scaling and squaring, and d_psi is (g * rf_psi) integrated the same
+    way. See the module docstring for the role of each field and of the rigidity terms.
 
-      rf_psi + rf_beta together replace v10's single free 3-vector
-      residual_free field: any 3D direction is exactly tangential + normal,
-      so no expressiveness is lost -- but the tangential part now goes
-      through the same diffeomorphic-integration treatment as phi, so it
-      can no longer fold the surface the way an unconstrained free vector
-      could.
+    At each level the four fields are created on a gh x gw control grid, initialised by
+    bilinear upsampling of the previous level's control points (zero at the first
+    level). Three blocks then run in turn, each optimising some fields with Adam while
+    the others are frozen: "Phi" (phi), "Alpha" (alpha) and "ResidualFree" (rf_psi and
+    rf_beta jointly). Each block minimises
+        image loss + bending energy of its fields + lamSheet * stay-inside-volume penalty
+        + lamOut * normal offset outside the soft mask (Alpha and ResidualFree only)
+        + lamRigid * (lam_area * L_area + lam_shape * L_shape),
+    and stops early after `patience` iterations without a decrease of the total loss.
+    The image loss compares the MRI sampled on the sheet (bilinear, zero outside the
+    MRI mask) with hist_t, masked by a soft-dilated histology mask (8 px dilation,
+    11 px blur). The base surface and normal are upsampled by `base_supersample` before
+    they are resampled, so the tangential lookup is smoother than bilinear interpolation
+    on the canvas grid. After each level and at the end, percentiles of the area ratio
+    against the base surface are printed for pixels with non-zero rigidity weight.
+
+    Args:
+        mri_t: MRI slab tensor (1, 1, Z, Y, X).
+        mri_mask_t: MRI mask tensor (1, 1, Z, Y, X); the sampled MRI is zero outside it.
+        hist_t: histology on the common canvas, tensor (1, 1, H, W).
+        hist_mask_t: histology mask tensor (1, 1, H, W), thresholded at 0.5.
+        xyz_norm_base: fixed base sheet, tensor (H, W, 3), normalised (x, y, z).
+        n0_base: unit normal field of xyz_norm_base, tensor (H, W, 3).
+        conf: match-support confidence, tensor (H, W) in [0, 1]; rf_psi and rf_beta are
+            multiplied by (1 - conf).
+        uv_norm_pix: tensor (H, W, 2), (x / (W-1), y / (H-1)) per canvas pixel; the
+            points where the B-spline fields are evaluated.
+        grid_id_2d: identity sampling grid for grid_sample, tensor (1, H, W, 2) in
+            [-1, 1], (x, y) order.
+        H: canvas height in pixels.
+        W: canvas width in pixels.
+        levels: list of dicts, one per pyramid level (coarse to fine), with keys
+            gh, gw: control-grid size;
+            nA, lrA, lamA: iterations, learning rate and bending weight for phi;
+            nB, lrB, lamB: the same for alpha;
+            nF, lrF, lamF: the same for rf_psi and rf_beta (one shared bending weight);
+            lamSheet: weight of sheet_inside_volume_penalty;
+            lamOut: weight of the squared normal offset outside the soft mask;
+            lamRigid (optional, default 1.0): multiplier on the rigidity loss.
+        device: torch device.
+        save_file: optional path prefix; if set, a plot of the final normalised z is
+            saved to "<save_file>_final.png".
+        frame_cb: optional callable(xyz_norm), called every `frame_every` iterations, on
+            the last iteration of each block and once on the final sheet.
+        frame_every: iteration interval for frame_cb.
+        patience: early-stopping patience per block, in iterations.
+        base_supersample: upsampling factor applied to the base surface and normal.
+        phi_n_steps: number of scaling-and-squaring steps for phi.
+        rf_psi_n_steps: number of scaling-and-squaring steps for rf_psi.
+        lam_area: weight of the properness term log(area / area0)^2.
+        lam_shape: weight of the orthonormality term (first-fundamental-form drift).
+        w_rigid_mode: per-pixel rigidity weight, "mask", "conf", "edge" or "none"
+            (see losses._build_rigidity_weight).
+        rigid_edge_k: edge gain for w_rigid_mode="edge".
+        similarity_weights: (w_ssim, w_ngf, w_mind). The image loss is always
+            losses.combined_masked_ssim_mind_loss (similarity_metric is fixed to "mind"
+            in the code), so w_ngf has no effect. The parameter profiles use (1, 0, 0)
+            (SSIM only) and (0, 0, 1) (MIND only).
+
+    Returns:
+        Tuple (phi, alpha, rf_psi, rf_beta, xyz_norm_final):
+            phi: BSplineFFD2D, velocity field at the finest level.
+            alpha: ScalarNormalOffsetField at the finest level.
+            rf_psi: BSplineFFD2D, ungated velocity field at the finest level.
+            rf_beta: ScalarNormalOffsetField, ungated, at the finest level.
+            xyz_norm_final: tensor (H, W, 3), refined sheet in normalised (x, y, z),
+                computed without gradient.
     """
-    similarity_metric = "mind"   # "ngf" or "mind" -- switch here to test MIND instead of NGF
+    similarity_metric = "mind"   # "ngf" or "mind": selects the image loss
     w_ssim, w_ngf, w_mind = similarity_weights
     hist_mask_fixed = (hist_mask_t > 0.5).float().detach()
     mask_soft = make_soft_dilated_mask(hist_mask_fixed, dilate_px=8, blur_ks=11, blur_passes=1).detach()
@@ -257,9 +440,9 @@ def pyramid_refinement(
     gate = (1.0 - conf).clamp(0.0, 1.0).detach()          # [H,W]
     gate3 = gate.unsqueeze(-1)                             # [H,W,1] for broadcasting onto 3-vectors
 
-    # ---- v12: local rigidity setup -------------------------------------------
+    # ---- Local rigidity setup ------------------------------------------------
     # dims recovers voxel-index coords from xyz_norm. Isotropic spacing => the
-    # physical scale cancels in every ratio below, so no GetSpacing() is needed.
+    # physical scale cancels in every ratio below, so no voxel spacing is needed.
     Zdim_r, Ydim_r, Xdim_r = mri_t.shape[-3:]
     dims_t = torch.tensor(
         [float(Xdim_r - 1), float(Ydim_r - 1), float(Zdim_r - 1)],
@@ -282,7 +465,7 @@ def pyramid_refinement(
           f"active_px={int((w_rigid > 0).sum())}/{H*W}")
 
     def _rigidity_terms(xyz_norm):
-        """(L_area, L_shape): w-weighted means. Both zero on a perfectly rigid refinement."""
+        """Return (L_area, L_shape) as w_rigid-weighted means; both are zero when the sheet keeps the base metric."""
         if not rigid_on:
             z = torch.zeros((), device=device, dtype=torch.float32)
             return z, z
@@ -299,11 +482,13 @@ def pyramid_refinement(
         return L_area, L_shape
 
     def _rigidity_loss(xyz_norm, cfg):
+        """Return ((L_area, L_shape), weighted rigidity loss) for one pyramid level."""
         L_area, L_shape = _rigidity_terms(xyz_norm)
         lam = float(cfg.get("lamRigid", 1.0))
         return (L_area, L_shape), lam * (float(lam_area) * L_area + float(lam_shape) * L_shape)
 
     def _report_area(tag, xyz_norm):
+        """Print area-ratio percentiles (sheet / base) over pixels with non-zero rigidity weight."""
         with torch.no_grad():
             r = surface_area_ratio(xyz_norm, xyz_norm_base, dims_t.detach().cpu().numpy())
             m = (w_rigid > 0).detach().cpu().numpy()
@@ -323,6 +508,7 @@ def pyramid_refinement(
         n0_base_img = n0_base_img / (n0_base_img.norm(dim=1, keepdim=True) + 1e-8)
 
     def _resample_surface(grid2d):
+        """Look up the (supersampled) base surface and unit normal at a (1, H, W, 2) sampling grid."""
         xyz = F.grid_sample(xyz_base_img, grid2d, mode="bilinear", padding_mode="border", align_corners=True)
         n0s = F.grid_sample(n0_base_img, grid2d, mode="bilinear", padding_mode="border", align_corners=True)
         xyz = xyz[0].permute(1, 2, 0)                       # (H,W,3)
@@ -333,9 +519,9 @@ def pyramid_refinement(
     def _scaling_and_squaring_2d(v, n_steps=6):
         # v: (H,W,2) stationary velocity field, same normalized [-1,1] units as grid_id_2d.
         # Integrates the flow ODE d(phi)/dt = v(phi(t)) from t=0 (identity) to t=1 by
-        # repeated self-composition of a tiny initial step -- this is the standard
-        # diffeomorphic-registration trick (Christensen fluid / VoxelMorph-diff / DARTEL):
-        # a smooth field composed with itself can't introduce folding, unlike one large jump.
+        # repeated self-composition of a small initial step v / 2^n_steps (scaling and
+        # squaring, as in diffeomorphic registration, e.g. DARTEL): a small smooth step
+        # composed with itself stays invertible, unlike one large displacement.
         d = v / (2 ** n_steps)
         for _ in range(n_steps):
             d_img = d.permute(2, 0, 1).unsqueeze(0)                     # (1,2,H,W)
@@ -345,16 +531,16 @@ def pyramid_refinement(
         return d
 
     def _compose_disp_2d(base_grid2d, extra_disp):
-        # base_grid2d: (1,H,W,2) sampling grid (e.g. phi's identity + integrated displacement).
-        # extra_disp:  (H,W,2) an ADDITIONAL displacement (e.g. rf_psi's gated, integrated
-        # velocity), evaluated AT base_grid2d's positions and added on top -- i.e. this
-        # composes "extra" AFTER "base" (extra_map ∘ base_map), which stays diffeomorphic
-        # if both individually are, without needing to touch base's own computation at all.
+        # base_grid2d: (1,H,W,2) sampling grid (e.g. identity + phi's integrated displacement).
+        # extra_disp:  (H,W,2) an additional displacement (e.g. rf_psi's gated, integrated
+        # velocity), evaluated at base_grid2d's positions and added on top. This composes
+        # "extra" after "base" (extra_map o base_map), which is diffeomorphic if both are.
         extra_img = extra_disp.permute(2, 0, 1).unsqueeze(0)                # (1,2,H,W)
         extra_at_base = F.grid_sample(extra_img, base_grid2d, mode="bilinear", padding_mode="border", align_corners=True)
         return base_grid2d + extra_at_base.permute(0, 2, 3, 1)              # (1,H,W,2)
 
     def _run_block(name, params, lr, n_iter, build_xyz_fn, reg_fn, print_extra_fn):
+        """Optimise `params` with Adam on image loss + reg_fn, with early stopping on the total loss."""
         opt = torch.optim.Adam([{"params": params, "lr": lr}])
         best_loss, no_improve = float("inf"), 0
         for it in range(n_iter):
@@ -425,7 +611,7 @@ def pyramid_refinement(
             rf_beta = ScalarNormalOffsetField(gh, gw, device=device).to(device)
             _copy_ctrl(rf_beta.ctrl, ctrl_up)
 
-        # ---- Step Phi: freeze alpha + rf_psi + rf_beta, optimize tangential resample ----
+        # ---- Step Phi: freeze alpha, rf_psi and rf_beta; optimise the tangential resample ----
         with torch.no_grad():
             a_fix = alpha(uv_norm_pix, H=H, W=W)
             disp_psi_fix = _scaling_and_squaring_2d(gate3 * rf_psi(uv_norm_pix, H=H, W=W), n_steps=rf_psi_n_steps)
@@ -455,7 +641,7 @@ def pyramid_refinement(
             lambda t: f"bend={t[0].item():.2e} sheet={t[1].item():.2e} area={t[2].item():.2e} shape={t[3].item():.2e}"
         )
 
-        # ---- Step Alpha: freeze phi + rf_psi + rf_beta, optimize normal offset ----
+        # ---- Step Alpha: freeze phi, rf_psi and rf_beta; optimise the normal offset ----
         with torch.no_grad():
             disp_fix = _scaling_and_squaring_2d(phi(uv_norm_pix, H=H, W=W), n_steps=phi_n_steps)
             grid2d_fix = grid_id_2d + disp_fix.unsqueeze(0)
@@ -487,8 +673,8 @@ def pyramid_refinement(
             lambda t: f"bend={t[0].item():.2e} sheet={t[1].item():.2e} out={t[2].item():.2e} area={t[3].item():.2e} shape={t[4].item():.2e}"
         )
 
-        # ---- Step ResidualFree: freeze phi + alpha, jointly optimize rf_psi (tangential,
-        # composed on top of phi) + rf_beta (normal), both gated by 1-conf ----
+        # ---- Step ResidualFree: freeze phi and alpha; jointly optimise rf_psi (tangential,
+        # composed after phi) and rf_beta (normal), both gated by 1 - conf ----
         with torch.no_grad():
             disp_fix = _scaling_and_squaring_2d(phi(uv_norm_pix, H=H, W=W), n_steps=phi_n_steps)
             grid2d_phi_fix = grid_id_2d + disp_fix.unsqueeze(0)
@@ -571,7 +757,7 @@ def refine_curved_sheet(
     gif_file=None,         # e.g. ".../refine_sheet.gif"
     gif_every=20,          # capture every N iters
     gif_fps=10,
-    # ---- v12: local rigidity (see module header) -----------------------------
+    # ---- local rigidity (see module docstring) --------------------------------
     lam_area=1.0,
     lam_shape=0.0,
     w_rigid_mode="mask",
@@ -579,9 +765,79 @@ def refine_curved_sheet(
     lam_rigid_levels=(1.0, 1.0, 1.0),   # per-pyramid-level multiplier on the rigidity loss
     similarity_weights=(1.0, 0.0, 0.0),  # (w_ssim, w_ngf, w_mind), passed to pyramid_refinement
 ):
+    """Refine the histology sheet inside the MRI slab by image similarity.
+
+    Steps:
+      1. Compute plane (u, v) and normalised pixel coordinates for every common-canvas
+         pixel (prepare_coords_from_G_canvas, using G["canvas_offset_yx"] if present).
+      2. Build the base sheet. init_tps is evaluated on the canvas plane grid; its
+         displacement from the G plane is clamped to tps_max_disp_vox voxels and scaled
+         by the support confidence conf, so the sheet falls back to G far from matches.
+         conf is computed from the distance d to the nearest ctrl_uv_support point:
+         exp(-d^2 / (2 sigma^2)), rescaled so that tps_min_conf maps to 0, clipped to
+         [0, 1], squared, and set to 0 for d > 2 sigma. A 12 x 12 B-spline residual
+         warm-started from the matches (warm_start_residual_ctrl_from_matches) is
+         added. The unit normal n0 is computed by central differences of the base
+         sheet in normalised coordinates.
+      3. Run pyramid_refinement on three levels with 12 x 12, 24 x 24 and 32 x 32
+         control grids and fixed per-level iteration counts, learning rates and
+         regularisation weights; lam_rigid_levels scales the rigidity loss per level.
+      4. Sample the MRI on the refined sheet with Catmull-Rom cubic interpolation.
+    Optionally, the sheet is rendered every `gif_every` iterations into a GIF.
+
+    Args:
+        slab_Im: MRI slab, SimpleITK image (from preprocessing.prepare_mri_slab).
+        slab_Mm: MRI slab mask, SimpleITK image on the same grid.
+        init_G: global plane dict; uses X0, e1, e2, A2_invT, t_xy, x_range, y_range,
+            plane_step and, if present, canvas_offset_yx.
+        init_tps: callable mapping a (N, 2) tensor of plane (u, v) to (N, 3) MRI voxel
+            positions (x, y, z); in the pipeline, tps.ResidualToGSurface3D (G plus the
+            residual 3D TPS).
+        matches_for_warmstart: list of match dicts with "hist_center_yx" (common-canvas
+            pixels) and "mri_center_zyx" (slab voxels), used for the residual warm start.
+        device: torch device string.
+        hist_on_init_tps: histology on the common canvas, SimpleITK image or array of
+            shape (H, W) or (1, H, W). Required; defines H and W.
+        hist_mask_on_init_tps: optional histology mask on the same grid; None means
+            all ones.
+        ctrl_uv_support: plane (u, v) of the inlier matches, tensor or array (M, 2);
+            None gives conf = 1 everywhere.
+        tps_sigma_uv: sigma of the confidence fall-off, in plane units.
+        tps_min_conf: confidence floor that is mapped to 0.
+        tps_max_disp_vox: maximum TPS displacement from the G plane, in voxels.
+        save_file: optional path prefix for the final-surface plot (see
+            pyramid_refinement).
+        gif_file: optional path of a GIF showing the sheet during the optimisation.
+        gif_every: GIF frame interval, in iterations.
+        gif_fps: GIF frame rate.
+        lam_area: weight of the properness (area) term; see pyramid_refinement.
+        lam_shape: weight of the orthonormality (shape) term; see pyramid_refinement.
+        w_rigid_mode: per-pixel rigidity weight mode; see pyramid_refinement.
+        rigid_edge_k: edge gain for w_rigid_mode="edge".
+        lam_rigid_levels: multipliers on the rigidity loss for the three pyramid
+            levels; if shorter than 3, the last value is repeated.
+        similarity_weights: (w_ssim, w_ngf, w_mind) for the image loss; see
+            pyramid_refinement.
+
+    Returns:
+        Tuple of 10 elements:
+            xyz_norm_final: tensor (H, W, 3), refined sheet in normalised (x, y, z).
+            mri_on_final_sheet: numpy array (H, W), MRI sampled on the refined sheet
+                (Catmull-Rom, border padding, not masked).
+            valid_out: numpy bool array (H, W), True where xyz_norm_final is finite and
+                inside [0, 1]^3.
+            xyz_norm_base: tensor (H, W, 3), base sheet before refinement.
+            conf: tensor (H, W), match-support confidence in [0, 1].
+            phi_refined: BSplineFFD2D, refined phi.
+            n0: tensor (H, W, 3), unit normal of the base sheet (normalised coordinates).
+            alpha_refined: ScalarNormalOffsetField, refined alpha.
+            rf_psi_refined: BSplineFFD2D, refined rf_psi (before gating).
+            rf_beta_refined: ScalarNormalOffsetField, refined rf_beta (before gating).
+    """
     print("\n-------- Refine Curved Sheet (v12: + local rigidity) --------")
 
     def _xyz_from_G_uv(uv_plane_flat, G, H, W, device):
+        """Return the G-plane voxel positions X0 + u*e1 + v*e2 as a (H, W, 3) tensor."""
         uv = uv_plane_flat.detach().cpu().numpy().reshape(H, W, 2).astype(np.float32)
         uu, vv = uv[..., 0], uv[..., 1]
         X0 = np.asarray(G["X0"], np.float32)
@@ -591,6 +847,7 @@ def refine_curved_sheet(
         return torch.from_numpy(xyz_g).to(device=device, dtype=torch.float32)
 
     def _support_conf_from_ctrl_uv(uv_plane_flat, ctrl_uv, H, W, device, sigma_uv=20.0, min_conf=0.25):
+        """Return the (H, W) match-support confidence from the distance to the nearest control (u, v)."""
         if ctrl_uv is None:
             return torch.ones((H, W), device=device, dtype=torch.float32)
         cuv = ctrl_uv.detach().cpu().numpy() if torch.is_tensor(ctrl_uv) else np.asarray(ctrl_uv, np.float32)
@@ -607,6 +864,7 @@ def refine_curved_sheet(
 
     def _build_xyz_norm_tps_safe(init_tps, G, uv_plane_flat, H, W, Xdim, Ydim, Zdim, device,
                                  ctrl_uv=None, sigma_uv=20.0, min_conf=0.25, max_disp_vox=16.0):
+        """Return the TPS sheet in normalised xyz, clamped and blended toward the G plane by confidence."""
         with torch.no_grad():
             xyz_tps = init_tps(uv_plane_flat.detach()).view(H, W, 3)  # voxel xyz
             xyz_g = _xyz_from_G_uv(uv_plane_flat, G, H, W, device)
@@ -725,9 +983,9 @@ def refine_curved_sheet(
             n0 = torch.cross(Su, Sv, dim=-1)
             n0 = (n0 / (n0.norm(dim=-1, keepdim=True) + 1e-8)).detach()
 
-            # Same confidence field used to blend TPS vs G-plane fallback above --
-            # reused here to gate residual_free's freedom (low conf = untrustworthy
-            # base surface = residual_free gets real freedom there).
+            # Same confidence field that blends the TPS with the G-plane fallback above;
+            # (1 - conf) gates rf_psi and rf_beta, so they are free only where the base
+            # surface lacks match support.
             conf = _support_conf_from_ctrl_uv(
                 uv_plane_flat_init, ctrl_uv_support, H, W, device,
                 sigma_uv=tps_sigma_uv, min_conf=tps_min_conf

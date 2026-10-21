@@ -1,4 +1,11 @@
-"""MRI plane at the matched ROI, and the common canvas shared by histology and MRI."""
+"""MRI plane at the matched ROI, and the common canvas shared by histology and MRI.
+
+Runs after outlier filtering and before the global-plane fit. A plane
+z = a*x + b*y + c (MRI voxel indices) is fitted to the clean match centers and
+the MRI slab is sampled on it, giving a 2D plane image whose row/column 0
+corresponds to MRI voxel (y0, x0). The histology and the plane image are then
+centered on a common canvas with offsets (oy_h, ox_h) and (oy_m, ox_m).
+"""
 import numpy as np
 import SimpleITK as sitk
 import torch.nn.functional as F
@@ -17,6 +24,33 @@ def resample_mri_on_plane_gpu(
     device="cuda:0",
     padding_mode="zeros"
 ):
+    """Sample an MRI volume on the plane z = a*x + b*y + c with trilinear interpolation.
+
+    A regular (x, y) grid is built over ``x_range`` x ``y_range`` with spacing
+    ``step``; z is computed from the plane and the volume is sampled with
+    ``torch.nn.functional.grid_sample`` (align_corners=True). Pixels whose z
+    falls outside [0, Z-1] are set to NaN. Pixels with x or y outside the
+    volume are not set to NaN; they get the ``padding_mode`` value.
+
+    Args:
+        mri_vol: MRI volume, SimpleITK image or array [Z, Y, X] (a 2D array is
+            treated as a single slice).
+        a: Plane coefficient for x (MRI voxels).
+        b: Plane coefficient for y (MRI voxels).
+        c: Plane offset (MRI voxels).
+        x_range: (min, max) x voxel index, inclusive; defaults to the full width.
+        y_range: (min, max) y voxel index, inclusive; defaults to the full height.
+        step: Grid spacing in voxels.
+        device: Torch device used for sampling.
+        padding_mode: ``grid_sample`` padding mode for out-of-volume samples.
+
+    Returns:
+        Tuple (plane_img, XX, YY, ZZ, valid), all arrays [H, W] with row i at
+        y = y_range[0] + i*step and column j at x = x_range[0] + j*step:
+            plane_img: Sampled intensities (float32), NaN where z is out of range.
+            XX, YY, ZZ: MRI voxel coordinates of each sample.
+            valid: bool mask, True where z is inside the volume.
+    """
     vol = _to_zyx_volume(mri_vol)
     Z, Y, X = vol.shape
 
@@ -64,6 +98,48 @@ def visualize_matches_on_image(
     step=1.0,
     save_file=None,
 ):
+    """Compute the MRI plane image at the ROI and plot match coverage on histology and plane.
+
+    Besides plotting, this computes the plane image that the pipeline uses
+    for the global-plane fit. Steps:
+
+    1. Histology support: convex hull of the match centers
+       (``hist_center_yx``) on the scaled histology and the fraction of
+       image pixels inside it.
+    2. Plane image: unweighted least-squares fit of z = a*x + b*y + c to
+       ``pts_clean``, then ``resample_mri_on_plane_gpu`` over the (x, y)
+       bounding box of the points enlarged by ``margin_xy + pad_xy`` voxels
+       on each side (the lower bounds can become negative).
+    3. Plane support: convex hull of the MRI centers in plane-image pixels,
+       and its coverage over all pixels and over non-NaN pixels.
+
+    A two-panel figure (histology hull, plane hull) is shown and optionally
+    saved, and the coverages and plane equation are printed.
+
+    Args:
+        clean_matches: Outlier-filtered match dicts (needs ``hist_center_yx``
+            and ``mri_center_zyx``); at least 3 are required.
+        scaled_proc_Ih: Scaled, prepared histology (SimpleITK image or array;
+            a 3D array uses slice 0).
+        pts_clean: float array [N, 3], MRI centers of ``clean_matches`` as
+            (z, y, x) voxel indices.
+        slab_Im: Prepared MRI slab (SimpleITK image or array [Z, Y, X]).
+        device: Torch device for plane sampling.
+        margin_xy: Margin in voxels added around the match bounding box
+            (lower bounds are clipped at 0).
+        pad_xy: Extra padding in voxels added after the margin (not clipped).
+        step: Plane grid spacing in voxels.
+        save_file: Optional path for the figure (PNG, 200 dpi).
+
+    Returns:
+        dict with ``plane_img`` (float array [H, W], NaN where the plane
+        leaves the slab in z) and the integer MRI voxel bounds ``x0``, ``x1``,
+        ``y0``, ``y1`` of the sampled grid (row 0 is y0, column 0 is x0).
+
+    Raises:
+        ValueError: If fewer than 3 matches, valid MRI points, or points
+            inside the plane image are available for a hull.
+    """
     # ---------- Left panel: histology support ----------
     h = sitk.GetArrayFromImage(scaled_proc_Ih) if hasattr(scaled_proc_Ih, "GetSize") else np.asarray(scaled_proc_Ih)
     if h.ndim == 3:
@@ -103,6 +179,7 @@ def visualize_matches_on_image(
     )
 
     # ---------- Right panel: plane support ----------
+    # MRI (x, y) voxel positions converted to plane-image pixel coordinates.
     pts_xy = np.array(
         [[m["mri_center_zyx"][2], m["mri_center_zyx"][1]] for m in clean_matches if m["mri_center_zyx"][0] >= 0],
         dtype=np.float32
@@ -193,6 +270,44 @@ def extract_roi_plane(
     save_file3=None,
     device="cuda:0",
 ):
+    """Draw the ROI QC figures and compute the MRI plane image at the matched ROI.
+
+    This is not only a QC step: the last call, ``visualize_matches_on_image``,
+    also returns the MRI plane image and its voxel bounds, which the pipeline
+    needs for the common canvas and the global-plane fit. Three figures are
+    shown, each optionally saved:
+
+    1. ``show_matched_pairs``: histology/MRI patch pairs of the clean matches
+       with their mask overlap (``save_file``).
+    2. ``visualize_roi_from_matches``: 3D match centers with a score-weighted
+       plane, and XZ/YZ maximum-intensity projections of the slab between
+       z_min and z_max (``save_file2``).
+    3. ``visualize_matches_on_image``: convex-hull support of the matches on
+       the histology and on the MRI plane image (``save_file3``).
+
+    Args:
+        slab_Im: Prepared MRI slab (SimpleITK image).
+        scaled_proc_Ih: Prepared histology after rescaling by the best scale.
+        pts_clean: float array [N, 3], MRI centers (z, y, x) of
+            ``clean_matches``.
+        sc_clean: Scores of ``clean_matches``. Not used.
+        all_matches: dict returned by ``match_patches``; uses ``hist_img``,
+            ``mri_img``, ``hist_mask`` and ``mri_mask``.
+        best_patch: Patch size in pixels used for matching.
+        coarse_matches: Matches after the coarse RANSAC stage. Not used.
+        clean_matches: Matches after both outlier-filter stages.
+        z_min: Lower z index of the slab band shown in the projections.
+        z_max: Upper z index of the slab band shown in the projections.
+        save_file: Optional path for the matched-pairs figure.
+        save_file2: Optional path for the 3D/XZ/YZ figure.
+        save_file3: Optional path for the hull-coverage figure.
+        device: Torch device for plane sampling.
+
+    Returns:
+        Tuple (plane_img, x0, x1, y0, y1): the MRI plane image [H, W] (NaN
+        where the plane leaves the slab in z) and the integer MRI voxel
+        bounds of its grid (row 0 is y0, column 0 is x0, step 1).
+    """
     show_matched_pairs(
         clean_matches,
         all_matches["hist_img"],
@@ -206,7 +321,7 @@ def extract_roi_plane(
 
 
     viz = visualize_roi_from_matches(
-        matches=clean_matches,   # or inlier_matches
+        matches=clean_matches,
         mri_vol=slab_Im,
         z_min=z_min,
         z_max=z_max,
@@ -229,6 +344,20 @@ def extract_roi_plane(
 
 
 def pad2d_to_canvas(img2d, Hc, Wc, oy, ox, fill=0.0):
+    """Place a 2D image on a larger canvas with its top-left corner at (oy, ox).
+
+    Args:
+        img2d: Image array [h, w].
+        Hc: Canvas height in pixels.
+        Wc: Canvas width in pixels.
+        oy: Row offset of the image on the canvas.
+        ox: Column offset of the image on the canvas.
+        fill: Value for canvas pixels not covered by the image.
+
+    Returns:
+        Array [Hc, Wc] with the dtype of ``img2d``. The image must fit inside
+        the canvas at the given offset.
+    """
     out = np.full((Hc, Wc), fill, dtype=img2d.dtype)
     h, w = img2d.shape
     out[oy:oy+h, ox:ox+w] = img2d
@@ -236,6 +365,30 @@ def pad2d_to_canvas(img2d, Hc, Wc, oy, ox, fill=0.0):
 
 
 def create_common_canvas(scaled_proc_Ih, scaled_proc_Mh, plane_img):
+    """Center the scaled histology and the MRI plane image on a shared 2D canvas.
+
+    The canvas is the element-wise maximum of the two image sizes, and each
+    image is centered on it. Canvas pixel (r, c) therefore corresponds to
+    histology pixel (r - oy_h, c - ox_h) and to plane-image pixel
+    (r - oy_m, c - ox_m), i.e. MRI voxel x = x0 + (c - ox_m), y = y0 + (r - oy_m)
+    for a plane grid with step 1.
+
+    Args:
+        scaled_proc_Ih: Scaled, prepared histology (SimpleITK image, 2D or
+            single-slice 3D).
+        scaled_proc_Mh: Matching histology mask (SimpleITK image).
+        plane_img: MRI plane image [Hm, Wm] from ``extract_roi_plane``.
+
+    Returns:
+        Tuple (Hc, Wc, oy_h, ox_h, oy_m, ox_m, hist_common, mri_common, mask_common):
+            Hc, Wc: Canvas height and width in pixels.
+            oy_h, ox_h: Row/column offset of the histology on the canvas.
+            oy_m, ox_m: Row/column offset of the MRI plane image on the canvas.
+            hist_common: float32 [Hc, Wc] histology on the canvas (0 outside).
+            mri_common: float32 [Hc, Wc] MRI plane image on the canvas (0
+                outside; NaNs of ``plane_img`` are kept).
+            mask_common: float32 [Hc, Wc] histology mask on the canvas.
+    """
     arr_h = sitk.GetArrayFromImage(scaled_proc_Ih).astype(np.float32)
     hist2d = arr_h[0] if arr_h.ndim == 3 else arr_h
 
@@ -247,7 +400,7 @@ def create_common_canvas(scaled_proc_Ih, scaled_proc_Mh, plane_img):
     Hm, Wm = mri2d.shape
     Hc = max(Hh, Hm)
     Wc = max(Wh, Wm)
-    # choose placement (centered here)
+    # Center both images on the canvas.
     oy_h = (Hc - Hh) // 2
     ox_h = (Wc - Wh) // 2
     oy_m = (Hc - Hm) // 2

@@ -1,4 +1,10 @@
-"""HOG + MIND late-fusion patch matching between histology and an MRI slab, with scale and patch-size search."""
+"""Match histology patches to MRI-slab patches with HOG + MIND (+ NGF) late fusion.
+
+Matching stage of the pipeline (after preprocessing, before outlier filtering): it searches the
+histology scale (search_scale) and patch size/stride (search_patch_config), rescales the histology
+(rescale_histology) and matches patches (match_patches). Histology positions are (y, x) pixel
+indices of the matched 2D image; MRI positions are (z, y, x) voxel indices into the slab array.
+"""
 import numpy as np
 import SimpleITK as sitk
 import torch.nn.functional as F
@@ -22,6 +28,48 @@ def build_mri_bank_hog_mind_ngf(
     device,
     keep_mri_bank_on_gpu=True,
 ):
+    """Build the MRI patch bank used by the plain matcher (run_patch_matching_hog_mind_fusion_gpu).
+
+    Every slice z of the slab in [z_min, z_max] is cut into mri_patch x mri_patch patches on a
+    grid with step mri_stride. A patch is kept when its centre voxel lies inside the MRI mask and
+    at least min_mri_mask_frac of its voxels are inside the mask. For each kept patch the bank
+    stores a masked HOG descriptor (Sobel gradients, L2-normalised), the patch mask, the raw
+    intensity patch (float16) and its top-left and centre positions. The plain matcher uses the
+    raw patches to recompute HOG, MIND and NGF on pairwise intersection masks.
+    It differs from build_mri_bank_hog_mind only in storing the raw patches as float16 (instead of
+    float32) and in explicitly falling back to the CPU tensors when the GPU copy fails.
+
+    Args:
+        slab_Im: MRI slab image (SimpleITK image or array), 3D (z, y, x) or 2D (y, x).
+        slab_Mm: MRI slab mask with the same shape as slab_Im; voxels > 0 are tissue.
+        mri_patch: Patch side length in slab voxels.
+        mri_stride: Grid step between patch top-left corners, in slab voxels.
+        cell_size: HOG cell side length in voxels; must divide mri_patch.
+        bins: Number of HOG orientation bins (signed, over 0 to 2*pi).
+        min_mri_mask_frac: Minimum fraction of a patch's voxels that must be inside the mask.
+        z_min: First slab slice to include (inclusive), or None for no lower limit.
+        z_max: Last slab slice to include (inclusive), or None for no upper limit.
+        device: torch device or device string; falls back to CPU if CUDA is not available.
+        keep_mri_bank_on_gpu: If True and the device is CUDA, also copy the HOG descriptors and
+            masks to the GPU (falls back to CPU on an out-of-memory RuntimeError).
+
+    Returns:
+        dict with
+            mri_img, mri_msk: the slab as float32 / bool arrays of shape (Z, H, W);
+            patch, mri_patch, mri_stride, cell_size, bins, min_mri_mask_frac, z_min, z_max:
+                the build parameters;
+            device_used: device string;
+            m_hog_cpu: [Nm, Fh] float16 HOG descriptors on CPU;
+            m_mk_cpu: [Nm, patch*patch] bool patch masks on CPU;
+            m_patches: [Nm, patch, patch] float16 raw intensity patches on CPU;
+            m_top, m_center: [Nm, 3] int32 arrays of (z, y, x) top-left and centre voxels;
+            Nm: number of bank patches;
+            bank_on_gpu: whether m_hog_bank / m_mk_bank are on the GPU;
+            m_hog_bank, m_mk_bank: the descriptors and masks used for matching (GPU or CPU).
+
+    Raises:
+        RuntimeError: If no MRI patch passes the mask filter.
+    """
     patch = int(mri_patch)
 
     if isinstance(device, torch.device):
@@ -116,7 +164,7 @@ def build_mri_bank_hog_mind_ngf(
 
     m_hog_cpu = torch.cat(m_hog_list, dim=0)       # CPU [Nm,Fh] float16
     m_mk_cpu = torch.cat(m_mk_list, dim=0)         # CPU [Nm,P] bool
-    m_patches = torch.cat(m_patch_list, dim=0)     # CPU [Nm,p,p] float32
+    m_patches = torch.cat(m_patch_list, dim=0)     # CPU [Nm,p,p] float16
     m_top = torch.cat(m_top_list, dim=0).cpu().numpy()
     m_center = torch.cat(m_center_list, dim=0).cpu().numpy()
     Nm = m_hog_cpu.shape[0]
@@ -188,6 +236,66 @@ def run_patch_matching_hog_mind_fusion_gpu(
     keep_mri_bank_on_gpu=True,
     mri_bank=None,
 ):
+    """Match each histology patch to its best MRI-slab patch (two-stage HOG + MIND + NGF fusion).
+
+    Histology patches are taken on a grid with step hist_stride and kept when at least
+    min_histo_mask_frac of their pixels are inside the histology mask. Stage 1 (shortlist): the
+    dot product of masked HOG descriptors is computed against the whole MRI bank, in chunks of
+    mri_chunk; pairs whose masks overlap in fewer than min_overlap_frac * patch**2 pixels are
+    excluded, and the topk_hog best MRI patches are kept per histology patch. Stage 2 (rerank):
+    for each shortlisted pair, HOG, MIND and NGF similarities are recomputed from the raw patches
+    restricted to the intersection of the two masks; each similarity is min-max normalised over
+    that histology patch's candidates, and the weighted mean
+    (w_hog*HOG + w_mind*MIND + w_ngf*NGF) / (w_hog + w_mind + w_ngf) picks the best candidate.
+    Because of the per-candidate-set normalisation, the score lies in [0, 1] and measures how
+    strongly the descriptors agree on one candidate, not an absolute similarity.
+    No padding is applied here; match_patches wraps this function and pads the borders.
+
+    Args:
+        proc_Ih: Prepared histology image (SimpleITK image or array), 2D (y, x) or (1, y, x).
+        histo_mask: Histology mask with the same shape; pixels > 0 are tissue.
+        slab_Im: MRI slab image, 3D (z, y, x) or 2D. Only used if mri_bank is None.
+        slab_Mm: MRI slab mask with the same shape. Only used if mri_bank is None.
+        hist_patch: Histology patch side length in pixels; must equal mri_patch.
+        hist_stride: Grid step between histology patches, in pixels.
+        mri_patch: MRI patch side length in voxels.
+        mri_stride: Grid step between MRI patches, in voxels.
+        cell_size: HOG cell side length; must divide the patch size.
+        bins: Number of HOG orientation bins.
+        min_histo_mask_frac: Minimum in-mask fraction for a histology patch to be matched.
+        min_mri_mask_frac: Minimum in-mask fraction for an MRI patch to enter the bank.
+        min_overlap_frac: Minimum mask overlap (fraction of patch**2 pixels) for a candidate pair.
+        topk_hog: Number of HOG shortlist candidates per histology patch.
+        w_hog: Fusion weight of the pairwise-masked HOG similarity.
+        w_mind: Fusion weight of the pairwise-masked MIND-SSC similarity.
+        w_ngf: Fusion weight of the pairwise-masked NGF similarity; 0 skips the NGF computation.
+        mind_radius: MIND patch (box filter) radius.
+        mind_dilation: MIND neighbour offset dilation.
+        hist_batch: Number of histology patches processed per batch.
+        mri_chunk: Number of MRI bank patches per chunk in the shortlist stage.
+        z_min: First slab slice for the bank (inclusive); only used if mri_bank is None.
+        z_max: Last slab slice for the bank (inclusive); only used if mri_bank is None.
+        device: torch device or device string; falls back to CPU if CUDA is not available.
+        keep_mri_bank_on_gpu: Passed to build_mri_bank_hog_mind_ngf when the bank is built here.
+        mri_bank: Optional precomputed bank from build_mri_bank_hog_mind_ngf. Its patch,
+            mri_stride, cell_size and bins must match the arguments.
+
+    Returns:
+        dict with
+            matches: list with one match dict per kept histology patch, with keys hist_index
+                (index among kept patches), hist_center_yx, hist_topleft_yx (histology pixels),
+                mri_center_zyx, mri_topleft_zyx (slab voxels), mri_coords (same as
+                mri_center_zyx) and score (fused score; -inf with MRI positions (-1, -1, -1) if no
+                candidate survived);
+            hist_img, hist_mask: the histology image (float32) and mask (bool) that were matched;
+            mri_img, mri_mask: the slab arrays stored in the bank, (Z, H, W);
+            device_used: device string;
+            metric: "HOG+MIND+NGF_fusion".
+
+    Raises:
+        ValueError: If all fusion weights are zero or the bank parameters do not match.
+        RuntimeError: If no histology patch passes the mask filter.
+    """
     assert hist_patch == mri_patch, "This function assumes same patch size for hist and MRI."
     patch = int(hist_patch)
     P = patch * patch
@@ -358,10 +466,11 @@ def run_patch_matching_hog_mind_fusion_gpu(
 
             md_sel_patch = m_patches[sel_cpu].to(dev, dtype=torch.float32, non_blocking=True)
 
-            # exact pairwise support for each candidate
+            # Pixels valid in both patches; all rerank similarities use only these.
             pair_mask = (hmask.unsqueeze(0) & md_sel_mask.bool())   # [K,P]
 
-            # optional extra safety: skip candidates with too little pairwise support
+            # Drop candidates whose intersection is too small. This also removes shortlist
+            # entries that stage 1 had set to -inf but that topk still returned.
             pair_ok = pair_mask.sum(dim=1) >= min_overlap
             if not torch.any(pair_ok):
                 continue
@@ -446,6 +555,19 @@ def run_patch_matching_hog_mind_fusion_gpu(
 
 
 def resize_hist_pair(hist_img_2d, hist_mask_2d, scale):
+    """Resize a 2D histology image and its mask by a uniform scale factor.
+
+    The image is resized bilinearly and the mask with nearest-neighbour interpolation. Each output
+    side is round(side * scale), but at least 32 pixels.
+
+    Args:
+        hist_img_2d: Histology image, numpy array (H, W).
+        hist_mask_2d: Histology mask, numpy array (H, W); values > 0 are tissue.
+        scale: Scale factor (> 1 enlarges).
+
+    Returns:
+        Tuple (image, mask): float32 array (H', W') and bool array (H', W').
+    """
     H, W = hist_img_2d.shape
     new_h = max(32, int(round(H * scale)))
     new_w = max(32, int(round(W * scale)))
@@ -459,6 +581,20 @@ def resize_hist_pair(hist_img_2d, hist_mask_2d, scale):
 
 
 def robust_match_score(matches, top_frac=0.30, min_keep=10):
+    """Summarise a match set by the median score of its best matches.
+
+    Takes the finite match scores, keeps the k highest with k = max(min_keep,
+    ceil(top_frac * n)), and returns their median. This is the score maximised by search_scale and
+    used to rank configurations in evaluate_fixed_scale_multi_patch.
+
+    Args:
+        matches: List of match dicts with a "score" key.
+        top_frac: Fraction of the finite scores to keep.
+        min_keep: Minimum number of scores to keep.
+
+    Returns:
+        float median of the top scores, or -inf if there is no finite score.
+    """
     if len(matches) == 0:
         return -np.inf
     s = np.array([m["score"] for m in matches], dtype=np.float32)
@@ -471,6 +607,22 @@ def robust_match_score(matches, top_frac=0.30, min_keep=10):
 
 
 def estimate_z_band(matches, score_quantile=0.7, k_mad=3.0, min_radius=8):
+    """Estimate the band of slab slices in which the histology section most likely lies.
+
+    Uses the matches with a valid MRI position and a finite score. The z centre is the median
+    slice of the best-scoring matches (score >= the score_quantile quantile, or the 10 best if
+    fewer than 10 pass); the half-width is max(min_radius, ceil(k_mad * MAD)) of those slices.
+
+    Args:
+        matches: List of match dicts with "mri_center_zyx" and "score".
+        score_quantile: Score quantile above which matches are used.
+        k_mad: Multiplier of the median absolute deviation of z.
+        min_radius: Minimum half-width of the band, in slices.
+
+    Returns:
+        Tuple (z_center, z_min, z_max) in slab slice indices; z_min is clipped at 0, z_max is not
+        clipped. (None, None, None) if there is no valid match.
+    """
     z = np.array([m["mri_center_zyx"][0] for m in matches], dtype=np.int32)
     s = np.array([m["score"] for m in matches], dtype=np.float32)
     valid = np.isfinite(s) & (z >= 0)
@@ -494,6 +646,7 @@ def estimate_z_band(matches, score_quantile=0.7, k_mad=3.0, min_radius=8):
 
 # ---------- border padding helpers ----------
 def _rb_pad_len(L, patch, stride):
+    """Return the end padding after which a patch grid with this stride covers all of length L."""
     if L < patch:
         return patch - L
     rem = (L - patch) % stride
@@ -501,7 +654,8 @@ def _rb_pad_len(L, patch, stride):
 
 
 def _pad2d_rb(arr2d, patch, stride):
-    ph = _rb_pad_len(arr2d.shape[0], patch, stride)
+    """Zero-pad a 2D array at the bottom and right; return (padded, (pad_y, pad_x))."""
+    ph =_rb_pad_len(arr2d.shape[0], patch, stride)
     pw = _rb_pad_len(arr2d.shape[1], patch, stride)
     if ph == 0 and pw == 0:
         return arr2d, (0, 0)
@@ -510,7 +664,8 @@ def _pad2d_rb(arr2d, patch, stride):
 
 
 def _pad3d_zyx_rb(vol, patch, stride):
-    ph = _rb_pad_len(vol.shape[1], patch, stride)  # Y
+    """Zero-pad a (z, y, x) volume at the bottom (y) and right (x); return (padded, (pad_y, pad_x))."""
+    ph =_rb_pad_len(vol.shape[1], patch, stride)  # Y
     pw = _rb_pad_len(vol.shape[2], patch, stride)  # X
     if ph == 0 and pw == 0:
         return vol, (0, 0)
@@ -526,10 +681,35 @@ def match_patches(
         z_min=None, z_max=None,
         mri_bank=None,
         **kwargs):
-    """
-    Wrapper: pad hist on right/bottom so border patches are included.
-    If mri_bank is not provided, pad MRI too and let the matcher build its bank.
-    If mri_bank is provided, reuse it directly.
+    """Match histology patches to the MRI slab, including patches at the right and bottom borders.
+
+    A patch grid only reaches the far border when (side - patch) is a multiple of the stride. The
+    histology image and mask are therefore zero-padded at the bottom and right (and up to at least
+    one patch) before calling run_patch_matching_hog_mind_fusion_gpu (HOG shortlist, then
+    pairwise-masked HOG + MIND + NGF rerank). Padding only at the bottom and right keeps all
+    pixel coordinates the same. If mri_bank is None the slab and its mask are padded in y and x
+    the same way and the matcher builds the bank; otherwise the given bank is used as is.
+    This is the matcher used for the final patch matching and by search_patch_config.
+
+    Args:
+        proc_Ih: Histology image (SimpleITK image or array), 2D (y, x) or (1, y, x).
+        histo_mask: Histology mask with the same shape; pixels > 0 are tissue.
+        slab_Im: MRI slab image, (z, y, x) or 2D.
+        slab_Mm: MRI slab mask with the same shape.
+        hist_patch: Histology patch side length in pixels (must equal mri_patch).
+        hist_stride: Histology patch grid step in pixels.
+        mri_patch: MRI patch side length in voxels.
+        mri_stride: MRI patch grid step in voxels.
+        z_min: First slab slice for the bank (inclusive), or None.
+        z_max: Last slab slice for the bank (inclusive), or None.
+        mri_bank: Optional precomputed bank from build_mri_bank_hog_mind_ngf.
+        **kwargs: Further arguments for run_patch_matching_hog_mind_fusion_gpu (descriptor
+            settings, fusion weights, batch sizes, device).
+
+    Returns:
+        The matcher's output dict (see run_patch_matching_hog_mind_fusion_gpu) plus
+        padding_info = {"hist_pad_bottom_right": (pad_y, pad_x), "mri_pad_bottom_right":
+        (pad_y, pad_x) or None when a bank was given}.
     """
     Ih = _to_numpy_image(proc_Ih).astype(np.float32)
     Mh = (_to_numpy_image(histo_mask) > 0)
@@ -589,7 +769,11 @@ def match_patches(
 
 # ---------- coarse scale search ----------
 def _filter_cfg_for_matcher(cfg, matcher_fn):
-    sig = inspect.signature(matcher_fn)
+    """Adapt a matcher config dict to matcher_fn's signature (rename batch keys, drop unknown keys).
+
+    Unknown keys are kept if matcher_fn accepts **kwargs.
+    """
+    sig =inspect.signature(matcher_fn)
     params = sig.parameters
     accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
@@ -605,7 +789,7 @@ def _filter_cfg_for_matcher(cfg, matcher_fn):
     return {k: v for k, v in out.items() if k in params}
 
 
-# ---------- MRI bank builder (extracted from v6's inline loop, unchanged math) ----------
+# ---------- MRI bank builder for the cached matcher ----------
 def build_mri_bank_hog_mind(
     slab_Im, slab_Mm,
     mri_patch, mri_stride,
@@ -615,6 +799,36 @@ def build_mri_bank_hog_mind(
     device,
     keep_mri_bank_on_gpu=True,
 ):
+    """Build the MRI patch bank used by the cached matcher (search_scale).
+
+    Same patch extraction and filtering as build_mri_bank_hog_mind_ngf: patches on a grid with
+    step mri_stride in every slice in [z_min, z_max], kept when the centre voxel is in the mask
+    and at least min_mri_mask_frac of the patch is in the mask. The bank stores masked HOG
+    descriptors (float16), patch masks and raw patches (float32), from which the cached matcher
+    computes MRI MIND descriptors on demand. Build it once and pass it to every call of
+    run_patch_matching_hog_mind_fusion_gpu_cached that uses the same patch size and stride.
+
+    Args:
+        slab_Im: MRI slab image (SimpleITK image or array), 3D (z, y, x) or 2D (y, x).
+        slab_Mm: MRI slab mask with the same shape; voxels > 0 are tissue.
+        mri_patch: Patch side length in slab voxels.
+        mri_stride: Grid step between patch top-left corners, in voxels.
+        cell_size: HOG cell side length in voxels; must divide mri_patch.
+        bins: Number of HOG orientation bins.
+        min_mri_mask_frac: Minimum fraction of a patch's voxels inside the mask.
+        z_min: First slice to include (inclusive), or None.
+        z_max: Last slice to include (inclusive), or None.
+        device: torch device or device string; falls back to CPU if CUDA is not available.
+        keep_mri_bank_on_gpu: If True and the device is CUDA, also copy HOG descriptors and masks
+            to the GPU (stays on CPU if that raises a RuntimeError).
+
+    Returns:
+        dict with the same keys as build_mri_bank_hog_mind_ngf; m_patches is float32
+        [Nm, patch, patch].
+
+    Raises:
+        RuntimeError: If no MRI patch passes the mask filter.
+    """
     patch = int(mri_patch)
 
     if isinstance(device, torch.device):
@@ -722,7 +936,7 @@ def build_mri_bank_hog_mind(
     }
 
 
-# ---------- v6-style matcher, but accepts a precomputed mri_bank ----------
+# ---------- Cached HOG + MIND matcher (reusable MRI bank, used by the scale search) ----------
 def run_patch_matching_hog_mind_fusion_gpu_cached(
     proc_Ih, histo_mask, slab_Im, slab_Mm,
     hist_patch=64, hist_stride=32, mri_patch=64, mri_stride=4,
@@ -735,6 +949,58 @@ def run_patch_matching_hog_mind_fusion_gpu_cached(
     device="cuda:0", keep_mri_bank_on_gpu=True, mind_compute_batch=512,
     mri_bank=None,
 ):
+    """Match each histology patch to its best MRI patch with a cheaper HOG + MIND fusion.
+
+    Faster variant of run_patch_matching_hog_mind_fusion_gpu for repeated calls against the same
+    MRI bank (search_scale calls it once per candidate scale). The HOG shortlist stage is the
+    same. The rerank differs from the plain path:
+      * HOG and MIND descriptors are computed once per patch with that patch's own mask, not
+        recomputed on the pairwise intersection mask; the HOG rerank similarity is the same
+        descriptor dot product used for the shortlist;
+      * MRI MIND descriptors are computed only for shortlisted patches, in batches of
+        mind_compute_batch, and cached (float16, CPU) for the rest of this call;
+      * there is no NGF term, and the score is w_hog*HOG + w_mind*MIND of the per-candidate-set
+        min-max normalised similarities, not divided by the weight sum (in [0, 1] when the
+        weights sum to 1);
+      * the mask-overlap check is applied only in the shortlist stage.
+    No padding is applied here; see run_patch_matching_hog_mind_fusion_gpu_with_border_cached.
+
+    Args:
+        proc_Ih: Histology image (SimpleITK image or array), 2D (y, x) or (1, y, x).
+        histo_mask: Histology mask with the same shape; pixels > 0 are tissue.
+        slab_Im: MRI slab image (z, y, x). Only used if mri_bank is None.
+        slab_Mm: MRI slab mask. Only used if mri_bank is None.
+        hist_patch: Histology patch side length in pixels; must equal mri_patch.
+        hist_stride: Histology patch grid step in pixels.
+        mri_patch: MRI patch side length in voxels.
+        mri_stride: MRI patch grid step in voxels.
+        cell_size: HOG cell side length.
+        bins: Number of HOG orientation bins.
+        min_histo_mask_frac: Minimum in-mask fraction for a histology patch to be matched.
+        min_mri_mask_frac: Minimum in-mask fraction for an MRI bank patch (bank built here only).
+        min_overlap_frac: Minimum mask overlap (fraction of patch**2) in the shortlist stage.
+        topk_hog: Number of HOG shortlist candidates per histology patch.
+        w_hog: Weight of the HOG similarity.
+        w_mind: Weight of the MIND-SSC similarity.
+        mind_radius: MIND patch (box filter) radius.
+        mind_dilation: MIND neighbour offset dilation.
+        hist_batch: Number of histology patches per batch.
+        mri_chunk: Number of MRI bank patches per chunk in the shortlist stage.
+        z_min: First slab slice for the bank (inclusive); only used if mri_bank is None.
+        z_max: Last slab slice for the bank (inclusive); only used if mri_bank is None.
+        device: torch device or device string; falls back to CPU if CUDA is not available.
+        keep_mri_bank_on_gpu: Passed to build_mri_bank_hog_mind when the bank is built here.
+        mind_compute_batch: Number of MRI patches per batch when filling the MIND cache.
+        mri_bank: Optional bank from build_mri_bank_hog_mind; its patch and mri_stride must match.
+
+    Returns:
+        dict with matches, hist_img, hist_mask, mri_img, mri_mask and device_used as in
+        run_patch_matching_hog_mind_fusion_gpu, and metric "HOG+MIND_fusion".
+
+    Raises:
+        ValueError: If the bank's patch size or stride does not match.
+        RuntimeError: If no histology patch passes the mask filter.
+    """
     assert hist_patch == mri_patch, "This function assumes same patch size for hist and MRI."
     patch = int(hist_patch)
     P = patch * patch
@@ -810,6 +1076,7 @@ def run_patch_matching_hog_mind_fusion_gpu_cached(
     mind_cache = {}
 
     def get_mri_mind_desc(idxs, out_device=dev):
+        """Return MIND descriptors [len(idxs), Fm] of the given bank patches, computing missing ones."""
         idx_list = idxs.detach().cpu().tolist() if isinstance(idxs, torch.Tensor) else [int(i) for i in idxs]
         miss = [i for i in idx_list if i not in mind_cache]
         if len(miss) > 0:
@@ -919,12 +1186,36 @@ def run_patch_matching_hog_mind_fusion_gpu_cached(
     }
 
 
-# ---------- border-padded wrapper (mirrors your existing _with_border pattern) ----------
+# ---------- Border-padded wrapper for the cached matcher ----------
 def run_patch_matching_hog_mind_fusion_gpu_with_border_cached(
         proc_Ih, histo_mask, slab_Im, slab_Mm,
         hist_patch, hist_stride, mri_patch, mri_stride,
         z_min=None, z_max=None, mri_bank=None, **kwargs):
-    Ih = _to_numpy_image(proc_Ih).astype(np.float32)
+    """Run the cached HOG + MIND matcher with bottom/right border padding.
+
+    Same padding as match_patches, but calls run_patch_matching_hog_mind_fusion_gpu_cached. If
+    mri_bank is given, the slab arguments are not used (the bank must have been built from a
+    slab padded for the same mri_patch and mri_stride, as search_scale does). This is the default
+    matcher of search_scale.
+
+    Args:
+        proc_Ih: Histology image, 2D (y, x) or (1, y, x).
+        histo_mask: Histology mask with the same shape.
+        slab_Im: MRI slab image (z, y, x).
+        slab_Mm: MRI slab mask.
+        hist_patch: Histology patch side length in pixels (must equal mri_patch).
+        hist_stride: Histology patch grid step in pixels.
+        mri_patch: MRI patch side length in voxels.
+        mri_stride: MRI patch grid step in voxels.
+        z_min: First slab slice for a bank built here (inclusive), or None.
+        z_max: Last slab slice for a bank built here (inclusive), or None.
+        mri_bank: Optional bank from build_mri_bank_hog_mind.
+        **kwargs: Further arguments for run_patch_matching_hog_mind_fusion_gpu_cached.
+
+    Returns:
+        The cached matcher's output dict plus padding_info, as in match_patches.
+    """
+    Ih =_to_numpy_image(proc_Ih).astype(np.float32)
     Mh = (_to_numpy_image(histo_mask) > 0)
     if Ih.ndim == 3: Ih = Ih[0]
     if Mh.ndim == 3: Mh = Mh[0]
@@ -972,6 +1263,39 @@ def search_scale(
     matcher_fn=run_patch_matching_hog_mind_fusion_gpu_with_border_cached,
     verbose=True,
 ):
+    """Find the histology scale factor that best matches the MRI slab (coarse scale search).
+
+    For each candidate scale the histology and mask are resized (resize_hist_pair) and matched
+    against the slab with matcher_fn (by default the cached, border-padded HOG + MIND matcher).
+    The MRI bank (build_mri_bank_hog_mind, all slices, slab padded for the MRI patch and stride)
+    is built only once, because the MRI patch size and stride do not change across scales.
+    The scale with the highest robust_match_score (median of the top top_frac_score match
+    scores) is selected. The matcher config defaults to hist_patch=mri_patch=96, hist_stride=64,
+    mri_stride=8; entries of common_kwargs override it.
+
+    Args:
+        proc_Ih: Prepared histology image (SimpleITK image or array), 2D or (1, y, x).
+        histo_mask: Prepared histology mask with the same shape.
+        slab_Im: MRI slab image (z, y, x).
+        slab_Mm: MRI slab mask.
+        scales: Candidate scale factors (duplicates removed, sorted); default 1.00 to 1.30 in
+            steps of 0.05.
+        top_frac_score: Fraction of best matches used by robust_match_score.
+        common_kwargs: Matcher arguments (descriptor settings, weights, device, ...). With the
+            default matcher every key is forwarded, so each must be a parameter of
+            run_patch_matching_hog_mind_fusion_gpu_cached (w_ngf, for example, is not).
+        matcher_fn: Matcher with the signature of
+            run_patch_matching_hog_mind_fusion_gpu_with_border_cached; it receives mri_bank.
+        verbose: Print progress and the per-scale record.
+
+    Returns:
+        Tuple (best, records):
+            best: dict with score, scale, result (matcher output at that scale), z_center,
+                z_min, z_max (slice band from estimate_z_band, clipped to the slab; None if not
+                available);
+            records: one dict per scale (scale, score, n_matches, status, z_center, z_min,
+                z_max), sorted by score, best first.
+    """
     if common_kwargs is None:
         common_kwargs = {}
 
@@ -986,7 +1310,7 @@ def search_scale(
     records = []
     best = dict(score=-np.inf, scale=None, result=None, z_center=None, z_min=None, z_max=None)
 
-    # Default matcher config (same defaults as your v6 coarse_scale_search_hog_mind)
+    # Default coarse patch configuration
     run_cfg = dict(
         hist_patch=96,
         hist_stride=64,
@@ -1085,6 +1409,36 @@ def evaluate_fixed_scale_multi_patch(
     common_kwargs=None,
     matcher_fn=match_patches,
 ):
+    """Run patch matching at a fixed histology scale for several patch configurations.
+
+    The histology is resized once by best_scale. For each configuration in patch_matrix, an MRI
+    bank (build_mri_bank_hog_mind_ngf, slab padded for that patch size and stride, kept on CPU)
+    is built and matcher_fn (by default the plain HOG + MIND + NGF matcher match_patches) is run.
+    Each configuration is scored with robust_match_score (top 30%). A configuration that raises
+    an exception is reported and skipped. GPU and host memory are released after each
+    configuration because the banks are large.
+
+    Args:
+        proc_Ih: Prepared histology image (SimpleITK image or array), 2D or (1, y, x).
+        histo_mask: Prepared histology mask with the same shape.
+        slab_Im: MRI slab image (z, y, x).
+        slab_Mm: MRI slab mask.
+        best_scale: Histology scale factor (from search_scale).
+        patch_matrix: List of dicts with keys patch, hist_stride, mri_stride.
+        z_min: First slab slice for the bank (inclusive), or None.
+        z_max: Last slab slice for the bank (inclusive), or None.
+        common_kwargs: Extra matcher arguments; cell_size, bins, min_mri_mask_frac and device
+            are also used to build the bank.
+        matcher_fn: Matcher that accepts mri_bank (default match_patches).
+
+    Returns:
+        List of result dicts sorted by robust_score (best first), each with patch, hist_stride,
+        mri_stride, robust_score, n_matches and _out (matches, padding_info, device_used,
+        metric).
+
+    Raises:
+        RuntimeError: If every configuration failed.
+    """
     if common_kwargs is None:
         common_kwargs = {}
 
@@ -1211,7 +1565,20 @@ def evaluate_fixed_scale_multi_patch(
 
 # ---------- Score stability ----------
 def score_stability(matches, top_frac=0.30, min_keep=10):
-    s = np.array([m["score"] for m in matches], dtype=np.float32)
+    """Summarise the distribution of match scores, overall and for the best matches.
+
+    The top set is the k highest finite scores, with k = max(min_keep, ceil(top_frac * n)).
+
+    Args:
+        matches: List of match dicts with a "score" key.
+        top_frac: Fraction of finite scores in the top set.
+        min_keep: Minimum size of the top set.
+
+    Returns:
+        dict with n (number of finite scores), median, iqr, p10, p90 of all finite scores, and
+        median_top, iqr_top of the top set. All statistics are NaN if there is no finite score.
+    """
+    s =np.array([m["score"] for m in matches], dtype=np.float32)
     s = s[np.isfinite(s)]
     if s.size == 0:
         return dict(n=0, median=np.nan, iqr=np.nan, p10=np.nan, p90=np.nan, median_top=np.nan, iqr_top=np.nan)
@@ -1232,8 +1599,8 @@ def score_stability(matches, top_frac=0.30, min_keep=10):
 
 # ---------- Affine RANSAC (no external deps) ----------
 def _fit_affine_xy(src_xy, dst_xy):
-    # src_xy, dst_xy: [N,2], solve dst = A*[x,y,1]
-    N = src_xy.shape[0]
+    """Least-squares 2D affine M (2x3) with dst = M @ [x, y, 1]; src_xy and dst_xy are [N, 2]."""
+    N =src_xy.shape[0]
     X = np.zeros((2 * N, 6), dtype=np.float64)
     y = np.zeros((2 * N,), dtype=np.float64)
 
@@ -1251,10 +1618,10 @@ def _fit_affine_xy(src_xy, dst_xy):
 
 
 def _apply_affine_xy(src_xy, M):
+    """Apply a 2x3 affine M to points src_xy [N, 2]; return [N, 2]."""
     return src_xy @ M[:, :2].T + M[:, 2][None, :]
 
 
-# RANSAC finds a model with enough inliers (ok=True), not enough (ok=False)
 def ransac_affine_from_matches(
     matches,
     reproj_thresh=12.0,
@@ -1264,6 +1631,32 @@ def ransac_affine_from_matches(
     z_mad_k=3.0,
     z_min_tol=2.0,
 ):
+    """Fit a 2D affine map from histology (x, y) to MRI in-plane (x, y) with RANSAC.
+
+    Used to judge how geometrically consistent a match set is. Matches without an MRI position
+    are skipped. Matches whose slab slice z is far from the median slice (more than
+    max(z_mad_k * MAD, z_min_tol)) are removed, unless fewer than min_samples would remain.
+    The slice index is otherwise ignored: the model maps hist_center_yx to the (y, x) part of
+    mri_center_zyx. Each iteration fits an affine to min_samples random matches; the model with
+    the most inliers (reprojection error <= reproj_thresh), ties broken by the lower median
+    inlier error, is refitted on its inliers, and the inliers are recomputed.
+
+    Args:
+        matches: List of match dicts with hist_center_yx and mri_center_zyx.
+        reproj_thresh: Inlier threshold on the MRI in-plane error, in slab voxels.
+        n_iter: Number of RANSAC iterations.
+        min_samples: Matches per hypothesis (3 for an affine) and minimum inlier count.
+        seed: Random seed.
+        z_mad_k: Multiplier of the z MAD for the slice pre-filter.
+        z_min_tol: Minimum slice tolerance of the pre-filter.
+
+    Returns:
+        dict with ok. If ok is False, reason says why ("too_few_matches",
+        "too_few_valid_matches", "too_few_after_z_filter" or "no_model"). If ok is True:
+        M (2x3 affine, histology xy -> MRI xy), inlier_idx (indices into matches), inlier_count,
+        total_valid (matches after the z pre-filter), inlier_ratio (inlier_count / total_valid)
+        and median_reproj (median inlier error).
+    """
     if len(matches) < min_samples:
         return dict(ok=False, reason="too_few_matches")
 
@@ -1338,11 +1731,31 @@ def compare_patch_results_ransac(
     top_frac=0.30,
     seed=0,
 ):
+    """Rank patch configurations by the geometric consistency of their matches.
+
+    For each result of evaluate_fixed_scale_multi_patch, fits a RANSAC affine
+    (ransac_affine_from_matches) and computes score statistics (score_stability). Configurations
+    are sorted, best first, lexicographically by: RANSAC succeeded, inlier count, inlier ratio,
+    lower median reprojection error, higher median top score, lower IQR of the top scores.
+    The ranking table is printed.
+
+    Args:
+        res_list: Results from evaluate_fixed_scale_multi_patch.
+        reproj_thresh: RANSAC inlier threshold, in slab voxels.
+        n_iter: Number of RANSAC iterations.
+        top_frac: Fraction of best scores used by score_stability.
+        seed: RANSAC random seed.
+
+    Returns:
+        List of row dicts sorted best first, with patch, hist_stride, mri_stride, robust_score,
+        n_matches, score_median_top, score_iqr_top, ransac_ok, inlier_count, inlier_ratio,
+        median_reproj, and _ransac (full RANSAC result), _matches and _out.
+    """
     rows = []
     for r in res_list:
         matches = r["_out"]["matches"]
-        # Computes score distribution quality
-        st = score_stability(matches, top_frac=top_frac)
+        # Score distribution statistics (tie-breakers in the ranking below)
+        st =score_stability(matches, top_frac=top_frac)
         rr = ransac_affine_from_matches(
             matches,
             reproj_thresh=reproj_thresh,
@@ -1393,10 +1806,27 @@ def compare_patch_results_ransac(
     return rows_sorted
 
 
-# ---------- Combine inliers from top-K configs ----------
+# ---------- Slice band from RANSAC inliers ----------
 
 def z_band_from_inliers(inlier_matches, k_mad=3.0, min_radius=8):
-    z = np.array([m["mri_center_zyx"][0] for m in inlier_matches], dtype=np.int32)
+    """Estimate the slab slice band from a set of (inlier) matches.
+
+    The centre is the median slice of the valid matches; the half-width is
+    max(min_radius, ceil(k_mad * MAD)).
+
+    Args:
+        inlier_matches: List of match dicts with mri_center_zyx.
+        k_mad: Multiplier of the median absolute deviation of z.
+        min_radius: Minimum half-width, in slices.
+
+    Returns:
+        Tuple (z_center, z_min, z_max, z_radius) in slab slice indices; z_min is clipped at 0,
+        z_max is not clipped.
+
+    Raises:
+        RuntimeError: If no match has a valid slice index.
+    """
+    z =np.array([m["mri_center_zyx"][0] for m in inlier_matches], dtype=np.int32)
     z = z[z >= 0]
     if len(z) == 0:
         raise RuntimeError("No valid z in inlier_matches.")
@@ -1411,14 +1841,23 @@ def z_band_from_inliers(inlier_matches, k_mad=3.0, min_radius=8):
 
 
 def rescale_histology(proc_Ih, proc_Mh, best_scale, preserve_physical_size=True):
-    """
-    Returns:
-      h_scaled_sitk (sitk.Image), m_scaled_sitk (sitk.Image)
+    """Resize the prepared histology and its mask by the best scale and return SimpleITK images.
 
-    Notes:
-    - 2D input stays 2D.
-    - 3D scalar input is collapsed to one 2D plane for scaling, then returned as [1,H,W].
-    - This matches the rest of this file, which later uses arr[0] for histology.
+    Uses the same resizing as resize_hist_pair (bilinear image, nearest-neighbour mask, each side
+    round(side * best_scale) but at least 32 pixels). A 2D input gives a 2D output; a 3D input
+    is resized from its first plane and returned with shape (1, H', W'). For SimpleITK inputs the
+    origin and direction are copied; the spacing is copied too and, with
+    preserve_physical_size, its x and y entries are multiplied by old/new size so that the
+    physical extent of the image stays the same.
+
+    Args:
+        proc_Ih: Prepared histology image (SimpleITK image or array), 2D or (1, H, W).
+        proc_Mh: Prepared histology mask (SimpleITK image or array); values > 0 are tissue.
+        best_scale: Scale factor (from search_scale).
+        preserve_physical_size: If True, adjust the spacing to keep the physical size.
+
+    Returns:
+        Tuple (h_scaled, m_scaled) of SimpleITK images: float32 image and uint8 {0, 1} mask.
     """
     if sitk is None:
         raise ImportError("SimpleITK is required for returning SITK images.")
@@ -1429,13 +1868,11 @@ def rescale_histology(proc_Ih, proc_Mh, best_scale, preserve_physical_size=True)
     h_arr = sitk.GetArrayFromImage(proc_Ih) if is_h_sitk else np.asarray(proc_Ih)
     m_arr = sitk.GetArrayFromImage(proc_Mh) if is_m_sitk else np.asarray(proc_Mh)
 
-    # Keep output dimensionality compatible with downstream code.
+    # Return the same dimensionality as the input.
     h_return_3d = (h_arr.ndim == 3)
     m_return_3d = (m_arr.ndim == 3)
 
-    # Collapse to 2D for interpolation.
-    # If your stack has multiple real slices and you want a different one,
-    # change [0] to the desired slice index.
+    # Collapse to 2D for interpolation (_to_np2d keeps only the first plane of a 3D input).
     h2d = _to_np2d(proc_Ih)
     m2d = (_to_np2d(proc_Mh) > 0).astype(np.float32)
 
@@ -1495,6 +1932,34 @@ def search_patch_config(
     z_min=None, z_max=None,
     common_kwargs=None,
 ):
+    """Choose the patch size and strides for fine matching, and the slab slice band.
+
+    Runs the plain matcher at the fixed scale for every configuration in patch_matrix
+    (evaluate_fixed_scale_multi_patch), then ranks the configurations by RANSAC affine
+    consistency (compare_patch_results_ransac: inlier count first, then inlier ratio,
+    reprojection error and score statistics; reprojection threshold 12 voxels, seed 42). The
+    slice band is computed from the RANSAC inliers of the best configuration (z_band_from_inliers).
+
+    Args:
+        proc_Ih: Prepared histology image (not yet rescaled), 2D or (1, y, x).
+        proc_Mh: Prepared histology mask.
+        slab_Im: MRI slab image (z, y, x).
+        slab_Mm: MRI slab mask.
+        best_scale: Histology scale factor from search_scale.
+        patch_matrix: List of dicts with keys patch, hist_stride, mri_stride.
+        z_min: Not used; the search always runs over all slab slices.
+        z_max: Not used; see z_min.
+        common_kwargs: Matcher arguments passed to evaluate_fixed_scale_multi_patch.
+
+    Returns:
+        Tuple (patch, hist_stride, mri_stride, z_center, z_min, z_max): the chosen patch size
+        and strides (pixels / voxels) and the slice band (slab slice indices; z_min clipped at
+        0, z_max not clipped).
+
+    Raises:
+        RuntimeError: If every configuration failed, or if the best configuration has no
+            RANSAC inliers (z_band_from_inliers gets an empty list).
+    """
     res_list = evaluate_fixed_scale_multi_patch(
         proc_Ih=proc_Ih,
         histo_mask=proc_Mh,
@@ -1508,13 +1973,13 @@ def search_patch_config(
 
     rows_sorted = compare_patch_results_ransac(
         res_list,
-        reproj_thresh=12.0,  # tune to your pixel scale
+        reproj_thresh=12.0,  # slab voxels
         n_iter=2000,
         top_frac=0.30,
         seed=42
     )
 
-    # provisional best
+    # Best-ranked configuration
     best_row = rows_sorted[0]
     best_out = best_row["_out"]
     best_inliers = best_row["_ransac"]["inlier_idx"] if best_row["_ransac"]["ok"] else []

@@ -1,4 +1,10 @@
-"""Command-line entry point: run the pipeline over the sections listed in a CSV."""
+"""Command-line entry point: run the registration pipeline over the sections listed in a CSV.
+
+Each row of the sections CSV describes one histology section; main() calls
+pipeline.register_section for it, writes that section's outputs to
+<save-dir>/<subject_id>/<histo-type>/<num_str>/, and finally writes a summary CSV with one
+row per section. Matplotlib is switched to the non-interactive Agg backend on import.
+"""
 import matplotlib
 matplotlib.use("Agg")
 import argparse
@@ -16,6 +22,12 @@ from .pipeline import PROFILES, register_section
 
 
 def build_arg_parser():
+    """Build the argument parser of the batch command-line tool.
+
+    Returns:
+        argparse.ArgumentParser. The parsed namespace is passed as `args` to
+        pipeline.register_section, which reads several of its fields directly.
+    """
     p = argparse.ArgumentParser(description="Batch-run the full registration pipeline over sections")
     p.add_argument("--sections-csv", required=True,
                     help="One section per row. --ds-type internal: subject_id,slice_id,orientation,spacing. "
@@ -55,6 +67,14 @@ def build_arg_parser():
 
 @contextlib.contextmanager
 def suppress_output(enabled=True):
+    """Context manager that sends stdout and stderr to os.devnull while it is active.
+
+    Used to hide the print()/tqdm progress output of the pipeline modules; log files are
+    not affected.
+
+    Args:
+        enabled: If False, the context manager does nothing and output is shown.
+    """
     if not enabled:
         yield
         return
@@ -64,9 +84,29 @@ def suppress_output(enabled=True):
 
 
 def main():
+    """Run the pipeline on every section of --sections-csv and write a summary CSV.
+
+    For each row (up to --limit rows): build the section identifier num_str
+    (io.build_num_str), parse spacing, orientation and the optional flip column, pick the
+    profile (the row's "profile" column, else --profile), delete and recreate the section's
+    output directory <save-dir>/<subject_id>/<histo-type>/<num_str>, and call
+    pipeline.register_section with module output suppressed unless --verbose. A failure in
+    one section is reported (message and traceback on the console) and the loop continues.
+    The device is --device, or cuda:0 when CUDA is available, else cpu.
+
+    The summary CSV (--log-csv, default <save-dir>/run_log_<YYYYmmdd_HHMMSS>.csv) is written
+    once, after all rows. It has one row per section with the columns subject_id,
+    histo_type, num_str, status ("ok" or "error"), profile, and either the values returned
+    by register_section (output_npz, n_clean_matches, best_scale, elapsed_sec) or error (the
+    exception message) and elapsed_sec. Columns that do not apply to a row are empty.
+    """
     args = build_arg_parser().parse_args()
     device = torch.device(args.device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
 
+    # Patch-matcher settings shared by the scale search, the patch-configuration search and
+    # the fine matching: HOG cell size and orientation bins, minimum mask fractions per patch
+    # and minimum mask overlap, number of HOG candidates kept per histology patch, HOG/MIND
+    # fusion weights, MIND radius and dilation, and batch/chunk sizes.
     common_kwargs = dict(
         device=device,
         cell_size=8, bins=18,

@@ -1,4 +1,12 @@
-"""HOG, MIND and NGF patch descriptors and masked patch similarities (GPU)."""
+"""Patch descriptors and masked patch similarities for histology-MRI matching (torch, GPU).
+
+Used by matching to score histology patches against in-plane MRI slab
+patches. Provides HOG (orientation histograms of Sobel gradients), a MIND-style
+self-similarity descriptor over an 8-neighbourhood, and normalised gradient
+fields (NGF). The pairwise functions compare one histology patch with a batch
+of MRI patches, each pair restricted to its own mask. Images are 2D (y, x) and
+patches flattened row-major; P = patch * patch.
+"""
 import numpy as np
 import SimpleITK as sitk
 import torch.nn.functional as F
@@ -6,6 +14,7 @@ import torch
 
 
 def _to_numpy_image(x):
+    """Return a sitk image or array as numpy, dropping a leading singleton axis."""
     if sitk is not None and isinstance(x, sitk.Image):
         arr = sitk.GetArrayFromImage(x)
     else:
@@ -17,6 +26,7 @@ def _to_numpy_image(x):
 
 
 def _prep_inputs(proc_Ih, histo_mask, slab_Im, slab_Mm):
+    """Return (histology [H, W] float32, its bool mask, MRI [Z, Y, X] float32, its bool mask)."""
     h = _to_numpy_image(proc_Ih)
     hm = _to_numpy_image(histo_mask)
     m = _to_numpy_image(slab_Im)
@@ -31,6 +41,7 @@ def _prep_inputs(proc_Ih, histo_mask, slab_Im, slab_Mm):
 
 
 def _sobel_xy(img_hw, device):
+    """Return 3x3 Sobel gradients (gx, gy) of a 2D image as [H, W] tensors (zero padding)."""
     x = torch.as_tensor(img_hw, device=device, dtype=torch.float32)[None, None]
     kx = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], device=device, dtype=torch.float32).view(1,1,3,3)
     ky = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], device=device, dtype=torch.float32).view(1,1,3,3)
@@ -40,11 +51,19 @@ def _sobel_xy(img_hw, device):
 
 
 def _unfold_hw(t_hw, patch, stride):
+    """Extract patch x patch windows at the given stride from [H, W]; returns [N, P] (row-major)."""
     return F.unfold(t_hw[None, None], kernel_size=(patch, patch), stride=(stride, stride)).squeeze(0).T
 
 
 @torch.no_grad()
 def _mind_ssc_2d(img, radius=2, dilation=1, eps=1e-8):
+    """Compute a MIND-style self-similarity descriptor with 8 channels per pixel.
+
+    For each of the 8 neighbour offsets (scaled by dilation), the squared
+    difference to the shifted image is box-averaged over (2*radius+1)^2; the
+    descriptor is exp(-ssd / mean_ssd) with the mean over channels, L2
+    normalised across channels. Reflect padding at the image border.
+    """
     # img: [B,1,H,W] -> [B,8,H,W]
     B, C, H, W = img.shape
     offsets = torch.tensor(
@@ -71,8 +90,8 @@ def _mind_ssc_2d(img, radius=2, dilation=1, eps=1e-8):
     return desc
 
 
-# --- keep for matcher ---
 def _norm01_torch(x, eps=1e-8):
+    """Min-max scale the finite entries of a tensor to [0, 1]; non-finite entries become 0."""
     x = x.to(torch.float32)
     m = torch.isfinite(x)
     out = torch.zeros_like(x)
@@ -85,6 +104,27 @@ def _norm01_torch(x, eps=1e-8):
 
 
 def _hog_from_unfolded(gx_u, gy_u, mk_u, patch=64, cell_size=8, bins=18, eps=1e-6, signed=True):
+    """Compute HOG descriptors for a batch of flattened gradient patches.
+
+    Gradient magnitude, zeroed outside mk_u, is voted into `bins` orientation
+    bins (signed: [0, 2*pi), unsigned: [0, pi)) with linear interpolation
+    between the two nearest bins, per cell_size x cell_size cell. The
+    concatenated cell histograms are L2 normalised as a whole (no block
+    normalisation).
+
+    Args:
+        gx_u: [N, P] x gradients of N patches.
+        gy_u: [N, P] y gradients.
+        mk_u: [N, P] bool mask.
+        patch: patch edge length (must be a multiple of cell_size).
+        cell_size: cell edge length in pixels.
+        bins: number of orientation bins.
+        eps: stabiliser for the magnitude and the normalisation.
+        signed: use signed (2*pi) or unsigned (pi) orientations.
+
+    Returns:
+        [N, (patch // cell_size)^2 * bins] L2-normalised descriptors.
+    """
     assert patch % cell_size == 0
     N, P = gx_u.shape
     n_cells = patch // cell_size
@@ -121,6 +161,7 @@ def _hog_from_unfolded(gx_u, gy_u, mk_u, patch=64, cell_size=8, bins=18, eps=1e-
 
 @torch.no_grad()
 def _mind_desc_from_patch_batch(patches_bpp, masks_bp, radius=2, dilation=1, eps=1e-8):
+    """Compute masked MIND descriptors for a batch of patches; returns [B, 8 * P], L2 normalised."""
     # patches_bpp: [B,p,p], masks_bp: [B,P] bool
     B, p, _ = patches_bpp.shape
     x = patches_bpp[:, None, :, :]  # [B,1,p,p]
@@ -134,6 +175,10 @@ def _mind_desc_from_patch_batch(patches_bpp, masks_bp, radius=2, dilation=1, eps
 
 
 def _masked_minmax_normalize_patch_batch(patches_bpp, masks_bp=None, eps=1e-8):
+    """Min-max scale each patch over its masked pixels and zero the rest; returns [B, p, p].
+
+    A patch with an empty mask falls back to its whole-patch min/max (and is then all zero).
+    """
     # patches_bpp: [B,p,p], masks_bp: [B,P] bool or None
     B, p, _ = patches_bpp.shape
     x = patches_bpp.to(torch.float32).reshape(B, -1)
@@ -163,6 +208,7 @@ def _masked_minmax_normalize_patch_batch(patches_bpp, masks_bp=None, eps=1e-8):
 
 @torch.no_grad()
 def _sobel_xy_patch_batch(patches_bpp):
+    """Return 3x3 Sobel gradients (gx, gy), each [B, p, p], of a patch batch (zero padding)."""
     # patches_bpp: [B,p,p]
     x = patches_bpp[:, None].to(torch.float32)  # [B,1,p,p]
     dev = x.device
@@ -191,6 +237,11 @@ def _pairwise_masked_hog_similarity(
     cell_size=8,
     bins=18,
 ):
+    """Return the HOG cosine similarity [B] of one histology patch with B MRI patches.
+
+    Gradients are taken on the full patches; each pair's HOG uses only the
+    pixels in its pair mask.
+    """
     # hist_patch_pp: [p,p]
     # mri_patches_bpp: [B,p,p]
     # pair_masks_bp: [B,P] bool
@@ -229,6 +280,11 @@ def _pairwise_masked_mind_similarity(
     radius=2,
     dilation=1,
 ):
+    """Return the MIND cosine similarity [B] of one histology patch with B MRI patches.
+
+    Descriptors are computed on the full patches and restricted to each pair's
+    mask before normalising.
+    """
     # hist_patch_pp: [p,p]
     # mri_patches_bpp: [B,p,p]
     # pair_masks_bp: [B,P] bool
@@ -259,6 +315,12 @@ def _pairwise_masked_ngf_similarity(
     pair_masks_bp,
     eps=1e-8,
 ):
+    """Return the masked NGF similarity [B] of one histology patch with B MRI patches.
+
+    Both patches are min-max normalised inside the pair mask (zero outside);
+    the score is the mean over masked pixels of
+    (grad I . grad J)^2 / (|grad I|^2 |grad J|^2 + eps), in [0, 1].
+    """
     # hist_patch_pp: [p,p]
     # mri_patches_bpp: [B,p,p]
     # pair_masks_bp: [B,P] bool
@@ -301,6 +363,7 @@ def _pairwise_masked_ngf_similarity(
 
 
 def _to_np2d(x):
+    """Return a sitk image or array as a 2D float32 array (first slice if 3D)."""
     arr = _to_numpy_image(x)
     if arr.ndim == 3:
         arr = arr[0]

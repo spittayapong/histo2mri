@@ -1,4 +1,14 @@
-"""Resample histology to MRI spacing and prepare histology and MRI-slab images for matching."""
+"""Resample histology to MRI spacing and prepare the histology and MRI slab for matching.
+
+First stage after loading. Histology goes HR (full resolution) -> LR (resampled
+to MRI spacing) -> proc (scaled in-plane and padded to a multiple of the patch
+size). The voxel-index affines between these frames are 4x4 homogeneous
+matrices acting on sitk index order (x, y, z, 1):
+    i_lr   = A_hr_to_lr   @ i_hr    (diagonal: spacing_hr / spacing_lr)
+    i_proc = A_lr_to_proc @ i_lr    (diagonal in-plane scale + lower padding)
+The pipeline composes them as A_hr_to_proc = A_lr_to_proc @ A_hr_to_lr, which
+the inverse stage uses to map results back to HR histology.
+"""
 import numpy as np
 import SimpleITK as sitk
 from skimage import morphology
@@ -7,9 +17,18 @@ from .qc import show_proc_image
 
 
 def voxel_index_affine_hr_to_lr(spacing_hr, spacing_lr):
-    """
-    HR voxel index -> LR voxel index (homogeneous 4x4).
-    Assumes same origin/direction and only spacing changes.
+    """Build the HR -> LR voxel-index affine for a pure spacing change.
+
+    Assumes both grids share origin and direction, so index 0 maps to index 0
+    and each axis scales by spacing_hr / spacing_lr.
+
+    Args:
+        spacing_hr: (x, y, z) spacing of the HR grid.
+        spacing_lr: (x, y, z) spacing of the LR grid.
+
+    Returns:
+        4x4 float64 diagonal affine mapping homogeneous (x, y, z, 1) HR indices
+        to LR indices.
     """
     spacing_hr = np.asarray(spacing_hr, dtype=np.float64)
     spacing_lr = np.asarray(spacing_lr, dtype=np.float64)
@@ -24,6 +43,22 @@ def voxel_index_affine_hr_to_lr(spacing_hr, spacing_lr):
 
 
 def resample_histo_to_mri(Ih_hr, Mh_hr, Im):
+    """Resample HR histology and its mask to the MRI voxel spacing.
+
+    The output keeps the histology origin and direction, takes the MRI
+    spacing, and has size ceil(size_hr * spacing_hr / spacing_mri) so the
+    physical extent is preserved. The image uses linear interpolation (no
+    anti-aliasing smoothing is applied) and the mask nearest-neighbour.
+
+    Args:
+        Ih_hr: HR histology, 3D sitk.Image (x, y, z), usually z size 1.
+        Mh_hr: HR histology tissue mask, same grid as Ih_hr.
+        Im: MRI volume, sitk.Image; only its spacing is used.
+
+    Returns:
+        Tuple (Ih, Mh, A_hr_to_lr): LR histology and mask (sitk.Image), and the
+        4x4 HR -> LR voxel-index affine.
+    """
     hist_size = Ih_hr.GetSize()
     hist_spacing = Ih_hr.GetSpacing()
     mri_spacing = Im.GetSpacing()
@@ -39,7 +74,7 @@ def resample_histo_to_mri(Ih_hr, Mh_hr, Im):
         for i in range(3)
     ]
 
-    # For moving mri back to high resolution histology space
+    # Kept so results can be mapped back to HR histology later
     A_hr_to_lr = voxel_index_affine_hr_to_lr(hist_spacing, mri_spacing)
 
     # Resample histology to MRI spacing
@@ -65,32 +100,29 @@ def resample_histo_to_mri(Ih_hr, Mh_hr, Im):
     return Ih, Mh, A_hr_to_lr
 
 
-# ------------------ InStep : Histology Image preparation ------------------ #
-# This step performs after finding approximately MRI slice
-# Prepare histology for registration:
-# - crop to mask
-# - scale shrikaged tissue
-# - normalize robust intensity
-# - pad to square
+# ------------------ Histology preparation ------------------ #
 def robust_intensity_prep(I, mask=None, pclip=(1, 99), eps=1e-8):
-    """
-    Robustly normalize a 2D MRI projection to [0,1].
+    """Rescale an image to [0, 1] between robust percentiles of its foreground.
 
-    Supports:
-      - NumPy arrays (returns NumPy array)
-      - SimpleITK.Image (returns SimpleITK.Image with same origin/spacing/direction)
+    Non-finite values are set to 0. The lo/hi percentiles (pclip) are taken
+    over the foreground (mask, or I > 0 if mask is None; all pixels if the
+    foreground is empty); if they coincide, the foreground min/max are used.
+    Foreground pixels are rescaled and clipped to [0, 1]; background pixels are
+    set to 0. Works on 2D or 3D input; the pipeline uses it on the MRI volume.
 
-    Foreground:
-      - If mask is None: I > 0 (computed in NumPy space)
-      - If mask is provided:
-          * NumPy array mask, or
-          * SimpleITK.Image mask (will be converted to NumPy and treated as boolean)
+    Args:
+        I: image, numpy array or sitk.Image.
+        mask: optional foreground mask, numpy array or sitk.Image, same shape
+            as I.
+        pclip: (low, high) percentiles.
+        eps: added to the denominator.
 
     Returns:
-        I01        : float32 image in [0,1] (NumPy or SimpleITK.Image)
-        stats      : dict with 'lo', 'hi', 'mean', 'std', 'pclip'
+        float32 image in [0, 1]: a sitk.Image with the input origin, spacing and
+        direction if I is a sitk.Image, else a numpy array. Summary statistics
+        (lo, hi, mean, std) are computed internally but not returned.
     """
-    # --- Detect SimpleITK input (without hard dependency if you import elsewhere)
+    # --- Detect SimpleITK input by duck typing
     is_sitk = hasattr(I, "GetSize") and hasattr(I, "GetSpacing") and hasattr(I, "GetOrigin")
 
     if is_sitk:
@@ -162,15 +194,27 @@ def robust_intensity_prep(I, mask=None, pclip=(1, 99), eps=1e-8):
 
 
 def scale_image_xy_grid(img, sx, sy, interp=sitk.sitkLinear):
-    """
-    Resamples onto a new grid by changing size/spacing (identity transform).
-    Z size/spacing unchanged.
-    Returns: (img_scaled, scaled_size_xyz)
+    """Rescale an image in x and y by changing its grid size and spacing.
+
+    Resamples with the identity transform onto a grid with the same origin and
+    direction, spacing / (sx, sy, 1) and size int(size * (sx, sy, 1)), so
+    pixel index i maps to roughly i * s and z is unchanged. Pixels outside the
+    input are 0.
+
+    Args:
+        img: 3D sitk.Image.
+        sx: scale factor along x.
+        sy: scale factor along y.
+        interp: sitk interpolator.
+
+    Returns:
+        Tuple (img_scaled, scaled_size): resampled sitk.Image and its (x, y, z)
+        size as an int array (truncated, at least 1).
     """
     size = np.array(img.GetSize(), dtype=int)          # (x,y,z)
     spacing = np.array(img.GetSpacing(), dtype=float)  # (sx,sy,sz)
 
-    # size after scaling (NOTE: truncation happens here)
+    # Size after scaling; int() truncates.
     scaled_size = np.maximum(1, (size * np.array([sx, sy, 1.0])).astype(int))
 
     new_spacing = spacing / np.array([sx, sy, 1.0])
@@ -190,9 +234,19 @@ def scale_image_xy_grid(img, sx, sy, interp=sitk.sitkLinear):
 
 
 def pad_xy_to_patch_multiple(img, patch_size, constant=0):
-    """
-    Pads ONLY X and Y to be divisible by patch_size. Z unchanged.
-    Returns: (padded_img, pad_lower_xyz, pad_upper_xyz)
+    """Pad x and y with a constant so both sizes are multiples of patch_size.
+
+    Padding is split evenly between the lower and upper side (the extra pixel,
+    if any, goes to the upper side); z is not padded.
+
+    Args:
+        img: 3D sitk.Image.
+        patch_size: patch edge length in pixels.
+        constant: pad value.
+
+    Returns:
+        Tuple (padded, pad_lower, pad_upper): padded sitk.Image and the
+        (x, y, z) int arrays of pixels added below and above.
     """
     size = np.array(img.GetSize(), dtype=int)  # (x,y,z)
 
@@ -218,15 +272,21 @@ def pad_xy_to_patch_multiple(img, patch_size, constant=0):
 
 
 def affine_lr_to_proc_voxel(Ih_lr, scaled_size_xyz, pad_lower_xyz):
-    """
-    Returns A_lr_to_proc (4x4) in VOXEL (index) space such that:
-      [i_proc] = A_lr_to_proc * [i_lr]
+    """Build the LR -> proc voxel-index affine.
 
-    Your pipeline:
-      i_scaled ≈ S * i_lr
-      i_proc   = i_scaled + pad_lower
+    Models i_scaled ~= S * i_lr (scale_image_xy_grid) followed by
+    i_proc = i_scaled + pad_lower (pad_xy_to_patch_multiple), so
+    i_proc = A_lr_to_proc @ i_lr. S uses the effective scales
+    scaled_size / lr_size from the integer image sizes; z is unchanged.
 
-    We use effective scales computed from integer sizes to match what was produced.
+    Args:
+        Ih_lr: LR histology before scaling, sitk.Image.
+        scaled_size_xyz: (x, y, z) size after scaling, before padding.
+        pad_lower_xyz: (x, y, z) lower padding in pixels.
+
+    Returns:
+        4x4 float affine mapping homogeneous (x, y, z, 1) LR indices to proc
+        indices.
     """
     lr_size = np.array(Ih_lr.GetSize(), dtype=float)        # pre-scale
     scaled_size = np.array(scaled_size_xyz, dtype=float)    # post-scale, pre-pad
@@ -247,6 +307,24 @@ def affine_lr_to_proc_voxel(Ih_lr, scaled_size_xyz, pad_lower_xyz):
 
 
 def prepare_histology(Ih, Mh, scale_ratio, patch_size, show_proc_img=False, save_file=None):
+    """Scale the LR histology in-plane and pad it to a multiple of the patch size.
+
+    The image is scaled with linear and the mask with nearest-neighbour
+    interpolation (scale_image_xy_grid), then both are zero-padded in x and y
+    (pad_xy_to_patch_multiple). Intensities are not normalised here.
+
+    Args:
+        Ih: LR histology (at MRI spacing), sitk.Image.
+        Mh: LR histology mask, sitk.Image.
+        scale_ratio: (sy, sx) in-plane scale factors; the pipeline uses (1, 1).
+        patch_size: patch edge length in pixels.
+        show_proc_img: if True, show the prepared image and mask.
+        save_file: optional output path for that figure.
+
+    Returns:
+        Tuple (proc_Ih, proc_Mh, A_lr_to_proc): prepared histology and mask
+        (sitk.Image) and the 4x4 LR -> proc voxel-index affine.
+    """
     print("\n-------- Prepare Histology for Registration --------")
 
     sy, sx = scale_ratio
@@ -259,7 +337,7 @@ def prepare_histology(Ih, Mh, scale_ratio, patch_size, show_proc_img=False, save
     pad_Ih, pad_lower, pad_upper = pad_xy_to_patch_multiple(Ih_scaled, patch_size, constant=0)
     proc_Mh, _, _ = pad_xy_to_patch_multiple(Mh_scaled, patch_size, constant=0)
 
-    # 3) LR->proc affine in voxel space (matches steps 1+2)
+    # 3) LR -> proc voxel-index affine (steps 1 and 2)
     A_lr_to_proc = affine_lr_to_proc_voxel(Ih, scaled_size, pad_lower)
 
     proc_Ih = pad_Ih
@@ -270,19 +348,25 @@ def prepare_histology(Ih, Mh, scale_ratio, patch_size, show_proc_img=False, save
     return proc_Ih, proc_Mh, A_lr_to_proc
 
 
-# ------------------ MRI Image preparation ------------------ #
-# Prepare MRI for registration:
-# - extract MRI slab (+/- n_slices around max_index)
-# - normalize robust intensity
+# ------------------ MRI preparation ------------------ #
 
 def dilate_mask(mri_mask, ball_size=3):
+    """Dilate a 3D mask with a ball structuring element.
+
+    Args:
+        mri_mask: 3D sitk.Image mask.
+        ball_size: ball radius in voxels.
+
+    Returns:
+        uint8 sitk.Image with the dilated mask and the input spacing, origin
+        and direction.
+    """
     mri_mask_array = sitk.GetArrayFromImage(mri_mask)
 
     selem3d = ball(ball_size)  # radius in voxels
     mri_mask_array_dilated = morphology.binary_dilation(mri_mask_array, footprint=selem3d)
     mri_mask_bool = mri_mask_array_dilated.astype(np.uint8)
 
-    # Create a SimpleITK image from the numpy array
     dilated_mask_image = sitk.GetImageFromArray(mri_mask_bool)
 
     # Copy the header information (spacing, origin, direction) from the original image
@@ -294,6 +378,26 @@ def dilate_mask(mri_mask, ball_size=3):
 
 
 def prepare_mri_slab(Im, Mm, n_slices, show_proc_img=False, save_file=None, pclip=(1, 99)):
+    """Prepare the MRI volume for matching (the "slab").
+
+    The whole volume is kept (no slices are cropped). The mask is dilated by a
+    ball of radius 1 voxel, and the intensities are rescaled to [0, 1] between
+    the pclip percentiles inside the dilated mask, with zeros outside it
+    (robust_intensity_prep).
+
+    Args:
+        Im: MRI volume, sitk.Image.
+        Mm: MRI mask, sitk.Image.
+        n_slices: slice index shown in the optional display; not used
+            otherwise.
+        show_proc_img: if True, show the prepared slab and mask.
+        save_file: optional output path for that figure.
+        pclip: (low, high) intensity percentiles.
+
+    Returns:
+        Tuple (slab_raw_Im, slab_Im, slab_Mm): the unmodified MRI, the
+        normalised MRI and the dilated mask, all sitk.Image.
+    """
     print("\n-------- Prepare MRI Slab for Registration --------")
 
     slab_Mm = dilate_mask(Mm, ball_size=1)

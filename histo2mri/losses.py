@@ -1,10 +1,18 @@
-"""Image similarity losses (SSIM, NGF, MIND) and surface rigidity terms for the refinement."""
+"""Image similarity losses and surface-geometry terms for the curved-sheet refinement.
+
+Used by refine.pyramid_refinement. The losses compare the MRI sampled on the current sheet
+with the histology on the common canvas: images are (N, C, H, W) tensors (in practice
+N = C = 1) and every loss is averaged over mask pixels only. The geometry helpers work on
+xyz_norm, an (H, W, 3) grid of sheet positions normalised to [0, 1] per axis in (x, y, z)
+order; multiplying by (Xdim-1, Ydim-1, Zdim-1) gives MRI voxel-index coordinates.
+"""
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 
 def _gaussian_kernel(win, sigma, device, dtype):
+    """Return a normalised 2D Gaussian window of size (1, win, win)."""
     g = torch.arange(win, device=device, dtype=dtype) - win // 2
     g = torch.exp(-0.5 * (g / sigma) ** 2)
     g = (g / g.sum()).view(1, 1, win)
@@ -13,25 +21,43 @@ def _gaussian_kernel(win, sigma, device, dtype):
 
 
 def _sobel_kernels(device, dtype):
+    """Return the 3x3 Sobel kernels (sx, sy), each shaped (1, 1, 3, 3)."""
     sx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=device, dtype=dtype).view(1, 1, 3, 3)
     sy = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=device, dtype=dtype).view(1, 1, 3, 3)
     return sx, sy
 
 
 def _norm01_t(x):
+    """Min-max normalise x to [0, 1] over its last two (H, W) axes, per sample and channel."""
     return (x - x.amin(dim=(-2, -1), keepdim=True)) / (
         x.amax(dim=(-2, -1), keepdim=True) - x.amin(dim=(-2, -1), keepdim=True) + 1e-8
     )
 
 
 def combined_masked_ssim_ngf_loss(warped, hist, mask, w_ssim=0.5, w_ngf=0.5, win=11, sigma=1.5, eps=1e-8):
-    """
-    SSIM+NGF loss, masked consistently: both terms' final reduction is
-    restricted to mask==1 pixels. The previous version zeroed the images
-    before a plain SSIM .mean(), which diluted the loss with trivial
-    zero-zero background matches wherever the mask was 0 -- this computes
-    SSIM on the real (unmasked) images and only restricts the final
-    average, matching how the NGF term is already masked.
+    """Compute a weighted SSIM + NGF dissimilarity, averaged over mask pixels.
+
+    Both images are min-max normalised to [0, 1]. SSIM is computed on the full,
+    unmasked images with a Gaussian window (constants C1 = 0.01^2, C2 = 0.03^2) and
+    only the final average is restricted to the mask, so background pixels where both
+    images are zero do not inflate the score. The gradient term uses Sobel gradients
+    and penalises 1 - (grad w . grad h)^2 / (|grad w| |grad h|), averaged over the
+    same mask.
+
+    Args:
+        warped: MRI sampled on the sheet, tensor (N, 1, H, W).
+        hist: histology on the common canvas, tensor (N, 1, H, W).
+        mask: tensor broadcastable to (N, 1, H, W); pixels with mask > 0.1 count.
+        w_ssim: weight of the SSIM term.
+        w_ngf: weight of the gradient term.
+        win: SSIM window size in pixels.
+        sigma: standard deviation of the SSIM Gaussian window, in pixels.
+        eps: small constant for numerical stability.
+
+    Returns:
+        Tuple (loss, parts): loss is the scalar tensor
+        w_ssim * (1 - masked mean SSIM) + w_ngf * masked mean gradient term;
+        parts is a dict {"ssim": float, "ngf": float} with the two unweighted terms.
     """
     m = (mask > 0.1).float()
     w = _norm01_t(warped)
@@ -67,14 +93,12 @@ def combined_masked_ssim_ngf_loss(warped, hist, mask, w_ssim=0.5, w_ngf=0.5, win
 
 
 # ------------------------------------------------------------
-# SSIM + MIND alternative (MIND = Modality Independent Neighborhood
-# Descriptor). Compares local self-similarity patterns rather than raw
-# gradient direction, so it's less sensitive to histology/MRI contrast-
-# polarity mismatches than NGF. Kept alongside combined_masked_ssim_ngf_loss
-# (not replacing it) so either can be selected for testing.
+# MIND (Modality Independent Neighbourhood Descriptor) compares local
+# self-similarity patterns rather than raw intensities or gradient
+# directions, so it is less sensitive to histology/MRI contrast inversions.
 # ------------------------------------------------------------
 def _shift2d(x, dy, dx):
-    """Shift x by (dy,dx) with replicate padding. x: (N,C,H,W)"""
+    """Return x (N, C, H, W) shifted so that out[..., i, j] = x[..., i - dy, j - dx], replicating edges."""
     N, C, H, W = x.shape
     pad_t, pad_b = max(dy, 0), max(-dy, 0)
     pad_l, pad_r = max(dx, 0), max(-dx, 0)
@@ -85,9 +109,24 @@ def _shift2d(x, dy, dx):
 
 
 def mind_descriptor_2d(img, radius=1, dilation=1, sigma=0.8, eps=1e-8):
-    """
-    MIND-SSC-like descriptor for 2D images. img: (N,1,H,W).
-    Returns (N,8,H,W) -- one channel per 8-neighborhood offset.
+    """Compute a MIND-style self-similarity descriptor for a 2D image.
+
+    For each of the 8 neighbour offsets (scaled by `dilation`), the squared difference
+    between the image and its shifted copy is box-filtered over a (2*radius+1)^2 patch.
+    The patch distances are turned into exp(-d / v), where v is the per-pixel minimum
+    distance over the 8 offsets, optionally smoothed with a separable Gaussian, and
+    finally divided by their per-pixel mean over the 8 channels.
+
+    Args:
+        img: tensor (N, 1, H, W).
+        radius: half-size of the box filter for the patch distance, in pixels.
+        dilation: spacing of the neighbour offsets, in pixels.
+        sigma: standard deviation of the Gaussian smoothing of the descriptor, in
+            pixels; None or <= 0 disables it.
+        eps: small constant for numerical stability.
+
+    Returns:
+        Tensor (N, 8, H, W), one channel per neighbour offset.
     """
     offs = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
     offs = [(dy * dilation, dx * dilation) for dy, dx in offs]
@@ -117,6 +156,23 @@ def mind_descriptor_2d(img, radius=1, dilation=1, sigma=0.8, eps=1e-8):
 
 
 def masked_mind_loss(img1, img2, mask, radius=1, dilation=1, sigma=0.8, eps=1e-8):
+    """Compute the mask-weighted mean absolute difference between MIND descriptors.
+
+    The absolute descriptor difference is averaged over the 8 channels, multiplied by
+    `mask` (used as given, not binarised) and divided by the mask sum.
+
+    Args:
+        img1: tensor (N, 1, H, W).
+        img2: tensor (N, 1, H, W).
+        mask: tensor broadcastable to (N, 1, H, W), weights in [0, 1].
+        radius: see mind_descriptor_2d.
+        dilation: see mind_descriptor_2d.
+        sigma: see mind_descriptor_2d.
+        eps: small constant for numerical stability.
+
+    Returns:
+        Scalar tensor.
+    """
     d1 = mind_descriptor_2d(img1, radius=radius, dilation=dilation, sigma=sigma, eps=eps)
     d2 = mind_descriptor_2d(img2, radius=radius, dilation=dilation, sigma=sigma, eps=eps)
     diff = (d1 - d2).abs().mean(dim=1, keepdim=True)  # (N,1,H,W)
@@ -126,6 +182,30 @@ def masked_mind_loss(img1, img2, mask, radius=1, dilation=1, sigma=0.8, eps=1e-8
 def combined_masked_ssim_mind_loss(warped, hist, mask, w_ssim=0.9, w_mind=0.1,
                                     mind_radius=1, mind_dilation=1, mind_sigma=0.8,
                                     win=11, sigma=1.5, eps=1e-8):
+    """Compute a weighted SSIM + MIND dissimilarity, averaged over mask pixels.
+
+    The SSIM term is identical to the one in combined_masked_ssim_ngf_loss. The MIND
+    term is masked_mind_loss on the min-max normalised images, with the binarised
+    mask (mask > 0.1) as weight.
+
+    Args:
+        warped: MRI sampled on the sheet, tensor (N, 1, H, W).
+        hist: histology on the common canvas, tensor (N, 1, H, W).
+        mask: tensor broadcastable to (N, 1, H, W); pixels with mask > 0.1 count.
+        w_ssim: weight of the SSIM term.
+        w_mind: weight of the MIND term.
+        mind_radius: patch radius for the MIND descriptor, in pixels.
+        mind_dilation: neighbour spacing for the MIND descriptor, in pixels.
+        mind_sigma: Gaussian smoothing of the MIND descriptor, in pixels.
+        win: SSIM window size in pixels.
+        sigma: standard deviation of the SSIM Gaussian window, in pixels.
+        eps: small constant for numerical stability.
+
+    Returns:
+        Tuple (loss, parts): loss is the scalar tensor
+        w_ssim * (1 - masked mean SSIM) + w_mind * masked MIND distance;
+        parts is a dict {"ssim": float, "mind": float} with the two unweighted terms.
+    """
     m = (mask > 0.1).float()
     w = _norm01_t(warped)
     h = _norm01_t(hist)
@@ -153,10 +233,11 @@ def combined_masked_ssim_mind_loss(warped, hist, mask, w_ssim=0.9, w_mind=0.1,
 
 
 def _central_diff_su_sv(S):
-    """Central differences along image axes; one-sided at the borders.
+    """Return central differences (Su, Sv) of S (H, W, C), one-sided at the borders.
 
-    S: (H,W,C) -> (Su, Sv), each (H,W,C).  Su is d/dx (columns), Sv is d/dy (rows).
-    Same stencil as the fold check, so the two agree by construction.
+    Su is the derivative along columns (x), Sv along rows (y); both are (H, W, C). The
+    stencil is the same as in surface_area_ratio and in the base-normal computation of
+    refine.refine_curved_sheet.
     """
     Su = torch.zeros_like(S)
     Sv = torch.zeros_like(S)
@@ -170,7 +251,19 @@ def _central_diff_su_sv(S):
 
 
 def first_fundamental_form(xyz_norm, dims_t):
-    """(E, F, G) of the surface, in VOXEL units.  xyz_norm: (H,W,3) in [0,1]^3."""
+    """Compute the first fundamental form (E, F, G) of a sheet in voxel units.
+
+    The sheet is converted to voxel-index coordinates (xyz_norm * dims_t) and
+    differentiated with central differences per canvas pixel, giving E = Su.Su,
+    F = Su.Sv and G = Sv.Sv. sqrt(E*G - F^2) is the local area element.
+
+    Args:
+        xyz_norm: tensor (H, W, 3), normalised (x, y, z) positions in [0, 1].
+        dims_t: tensor (3,), (Xdim-1, Ydim-1, Zdim-1) of the MRI volume.
+
+    Returns:
+        Tuple (E, F, G) of tensors, each (H, W).
+    """
     S = xyz_norm * dims_t
     Su, Sv = _central_diff_su_sv(S)
     E = (Su * Su).sum(-1)
@@ -180,11 +273,22 @@ def first_fundamental_form(xyz_norm, dims_t):
 
 
 def surface_area_ratio(xyz_norm, xyz_norm_base, dims, eps=1e-12):
-    """Local area distortion of `xyz_norm` relative to `xyz_norm_base`.
+    """Compute the per-pixel area ratio of a sheet relative to a base sheet.
 
-    Returns a (H,W) numpy array.  1.0 == locally area-preserving.  This is the
-    melting metric: it is finite and positive even where the sheet never folds.
-    Spacing-independent for isotropic voxels (it is a ratio).
+    Both sheets are converted to voxel-index coordinates and the local area element
+    |Su x Sv| is computed with central differences. A value of 1 means the area is
+    locally preserved. Unlike a fold check (sign of the Jacobian), this measures
+    stretching and compression, which can happen without folding. Because it is a
+    ratio, the voxel spacing cancels for isotropic data.
+
+    Args:
+        xyz_norm: tensor or array (H, W, 3), normalised (x, y, z) positions in [0, 1].
+        xyz_norm_base: reference sheet, same shape and convention.
+        dims: sequence of 3, (Xdim-1, Ydim-1, Zdim-1) of the MRI volume.
+        eps: lower bound on the base area to avoid division by zero.
+
+    Returns:
+        numpy array (H, W), area of xyz_norm divided by area of xyz_norm_base.
     """
     def _np(x):
         return x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
@@ -205,15 +309,13 @@ def surface_area_ratio(xyz_norm, xyz_norm_base, dims, eps=1e-12):
 
 
 def _build_rigidity_weight(mode, mask_soft, conf, hist_t, edge_k=2.0, eps=1e-8):
-    """Spatial rigidity coefficient w(x) in [0, ~1+edge_k].  All inputs detached.
+    """Return the (H, W) per-pixel weight of the rigidity terms, in [0, 1 + edge_k]; inputs are detached.
 
-    "mask" : uniform inside the (soft-dilated) tissue mask.  Start here.
-    "conf" : rigid where the base surface has match support, free where it does
-             not.  Complements rf_psi, which is gated by (1 - conf).
-    "edge" : mask * (1 + edge_k * |grad(hist)| / max).  Pins the cortical ribbon
-             and ventricle walls, lets homogeneous white matter move.  Closest
-             analogue of "protect the bone" in the rigid-structure literature.
-    "none" : uniform 1 everywhere.
+    Modes: "mask" uses the soft tissue mask; "conf" uses mask * conf, so the sheet is
+    rigid where matches support the base surface and free elsewhere (the complement of
+    the (1 - conf) gate on rf_psi/rf_beta); "edge" uses mask * (1 + edge_k * |grad hist|
+    / max), stiffening high-contrast histology structures; "none" (or None) uses 1.
+    mask_soft is (1, 1, H, W), conf is (H, W) and hist_t is (1, 1, H, W).
     """
     m = mask_soft[0, 0].detach()
     if mode is None or mode == "none":

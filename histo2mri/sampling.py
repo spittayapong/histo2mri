@@ -1,4 +1,12 @@
-"""Cubic sampling of 3D volumes, robust normalisation and monotone LUTs."""
+"""Sample the MRI volume on a surface, plus intensity helpers for QC display.
+
+Used by curved-sheet refinement (refine) and the pull-back to HR histology
+(inverse). Volumes are torch tensors [1, 1, Z, Y, X] (sitk array order).
+Surface positions are given in (x, y, z) order, either normalised to [0, 1]
+per axis (sample_mri_on_sheet, align_corners=True, so 0 and 1 are the first
+and last voxel centres) or as voxel indices (sample_mri_cubic_3d). The robust
+normalisation and monotone quantile LUT helpers are used by the QC figures.
+"""
 import SimpleITK as sitk
 import torch
 import torch.nn.functional as F
@@ -6,13 +14,13 @@ import numpy as np
 
 
 def _prepare_data_tensor(sitk_img, device):
+    """Convert a scalar sitk image to a float32 tensor with batch and channel axes on device."""
     arr = sitk.GetArrayFromImage(sitk_img)
-    # Add a channel dimension if the image is scalar, then a batch dimension.
-    # 2D input        (H, W)     -> (1, 1, H, W)
-    # 3D input:
-    #   - (1, H, W)   -> treat as 2D slice -> (1, 1, H, W)
-    #   - (Z, Y, X)   -> 3D volume         -> (1, 1, Z, Y, X)
-    # 4D (already has channels)            -> just prepend batch.
+    # Shape handling:
+    #   (H, W)    -> (1, 1, H, W)
+    #   (1, H, W) -> treated as a 2D slice -> (1, 1, H, W)
+    #   (Z, Y, X) -> (1, 1, Z, Y, X)
+    #   4D        -> only a batch axis is prepended.
     tensor = torch.as_tensor(arr, dtype=torch.float32, device=device)
 
     # If a 3D array has a singleton depth (1, H, W), squeeze it to 2D.
@@ -30,14 +38,30 @@ def _prepare_data_tensor(sitk_img, device):
 
 
 def sample_mri_on_sheet(mri_t, mri_mask_t, xyz_norm_sheet):
+    """Sample the MRI trilinearly on a surface and mask it with the MRI mask.
+
+    Uses torch grid_sample with align_corners=True, so the result is
+    differentiable with respect to xyz_norm_sheet (used as the image term
+    during curved-sheet refinement). The image is sampled with border padding;
+    the mask is sampled with nearest interpolation and zero padding, binarised
+    (> 0) and multiplied into the image.
+
+    Args:
+        mri_t: MRI volume tensor [1, C, Z, Y, X].
+        mri_mask_t: MRI mask tensor [1, C, Z, Y, X].
+        xyz_norm_sheet: [H, W, 3] tensor of surface positions, normalised
+            (x, y, z) in [0, 1].
+
+    Returns:
+        Tensor [1, C, H, W]: masked MRI intensities on the surface.
+    """
     xg = 2*xyz_norm_sheet[..., 0] - 1.0
     yg = 2*xyz_norm_sheet[..., 1] - 1.0
     zg = 2*xyz_norm_sheet[..., 2] - 1.0
 
-    # Build grid: (1, 1, H, W, 3)
+    # grid_sample expects normalised (x, y, z) in [-1, 1]; shape (1, 1, H, W, 3).
     grid = torch.stack([xg, yg, zg], dim=-1).unsqueeze(0).unsqueeze(1)  # (1,1,H,W,3)
 
-    # Build grid: (1, 1, H, W, 3)
     warped3d = F.grid_sample(
         mri_t, grid,
         mode='bilinear',
@@ -51,20 +75,36 @@ def sample_mri_on_sheet(mri_t, mri_mask_t, xyz_norm_sheet):
         align_corners=True
         )
 
-    # Extract the 2D slice: (1, 1, H, W)
+    # Drop the singleton depth axis: (1, C, H, W)
     warped2d = warped3d[:, :, 0, :, :]
     warped2d_mask = warped3d_mask[:, :, 0, :, :]
 
-    # Ensure mask is binary (if it is not already)
     warped2d_mask = (warped2d_mask > 0).float()
 
-    # Apply mask
     warped2d_masked = warped2d * warped2d_mask
 
     return warped2d_masked
 
 
 def robust01(img, mask=None, pclip=(1, 99), eps=1e-8):
+    """Rescale an image to [0, 1] between robust percentiles.
+
+    The percentiles are computed over finite pixels inside mask; values are
+    clipped to [0, 1] after rescaling. If the percentiles coincide, the
+    min/max of the masked values are used; if no pixel is usable, the global
+    nanmin/nanmax.
+
+    Args:
+        img: array of any shape.
+        mask: optional bool array of the same shape; pixels used for the
+            percentiles.
+        pclip: (low, high) percentiles.
+        eps: added to the denominator.
+
+    Returns:
+        Tuple (x01, (lo, hi)): float32 array in [0, 1] with the shape of img,
+        and the intensity bounds that were mapped to 0 and 1.
+    """
     x = np.asarray(img, np.float32)
     if mask is None:
         mask = np.isfinite(x)
@@ -86,17 +126,37 @@ def make_monotone_lut(
     ref01,
     src_mask=None,
     ref_mask=None,
-    n_quant=512,          # you can go back to 2048 once it's stable
-    max_samples=1_000_000 # cap number of pixels used for quantiles
+    n_quant=512,
+    max_samples=1_000_000
 ):
-    # Quantile grid in [0,1]
+    """Build a monotone intensity LUT that maps the src distribution onto ref.
+
+    Quantile (histogram) matching: n_quant equally spaced quantiles of the
+    source and reference values form the knots (xq, yq) of a piecewise-linear
+    map. Duplicate source quantiles are dropped so xq is strictly increasing.
+    Inputs larger than max_samples are randomly subsampled (unseeded, so the
+    LUT can vary slightly between runs).
+
+    Args:
+        src01: source image, normally in [0, 1].
+        ref01: reference image, normally in [0, 1].
+        src_mask: optional bool mask selecting source pixels.
+        ref_mask: optional bool mask selecting reference pixels.
+        n_quant: number of quantile levels.
+        max_samples: maximum number of pixels per image used for quantiles.
+
+    Returns:
+        Tuple (xq, yq) of float32 knot arrays for apply_lut_monotone(). If
+        either input has no finite values, the identity (q, q); if the source
+        is constant, a map to the reference median.
+    """
+    # Quantile levels in [0, 1]
     q = np.linspace(0.0, 1.0, n_quant, dtype=np.float32)
 
-    # Apply masks
+    # Select masked pixels
     svals = src01[src_mask] if src_mask is not None else src01.ravel()
     rvals = ref01[ref_mask] if ref_mask is not None else ref01.ravel()
 
-    # To numpy float32 (saves memory vs float64)
     svals = np.asarray(svals, dtype=np.float32)
     rvals = np.asarray(rvals, dtype=np.float32)
 
@@ -121,7 +181,7 @@ def make_monotone_lut(
     xq = np.quantile(svals, q)
     yq = np.quantile(rvals, q)
 
-    # Enforce monotonic xq for np.interp
+    # np.interp needs strictly increasing xq: drop duplicate source quantiles
     xq_u, idx = np.unique(xq, return_index=True)
     yq_u = yq[idx]
 
@@ -134,15 +194,39 @@ def make_monotone_lut(
 
 
 def apply_lut_monotone(src01, xq, yq):
-    # Map src01 in [0,1] via piecewise linear, saturate outside
+    """Apply a piecewise-linear LUT built by make_monotone_lut().
+
+    Values outside [xq[0], xq[-1]] saturate to yq[0] or yq[-1].
+
+    Args:
+        src01: input array.
+        xq: increasing LUT input knots.
+        yq: LUT output knots.
+
+    Returns:
+        float32 array with the shape of src01.
+    """
     out = np.interp(src01.ravel(), xq, yq).reshape(src01.shape).astype(np.float32)
     return out
 
 
 # =========================
-# Cubic kernels + 3D sampler (your clamp-free version)
+# Cubic kernels and 3D cubic sampler
 # =========================
 def cubic_weights_catmull_rom(t: torch.Tensor, a: float = -0.5):
+    """Compute the 4 Keys cubic-convolution weights for a fractional offset.
+
+    Keys kernel with parameter a; a = -0.5 gives Catmull-Rom, which is
+    interpolating (passes through the samples) and slightly sharpening.
+
+    Args:
+        t: tensor of fractional offsets in [0, 1) from the floor sample.
+        a: Keys kernel parameter.
+
+    Returns:
+        Tensor of shape t.shape + (4,): weights for the samples at offsets
+        -1, 0, +1, +2 from the floor index.
+    """
     x0 = t + 1.0
     x1 = t
     x2 = 1.0 - t
@@ -166,6 +250,19 @@ def cubic_weights_catmull_rom(t: torch.Tensor, a: float = -0.5):
 
 
 def cubic_weights_bspline(t: torch.Tensor):
+    """Compute the 4 uniform cubic B-spline weights for a fractional offset.
+
+    The weights are applied directly to the samples without B-spline
+    prefiltering, so the result is a smoothing approximation, not an
+    interpolation.
+
+    Args:
+        t: tensor of fractional offsets in [0, 1) from the floor sample.
+
+    Returns:
+        Tensor of shape t.shape + (4,): weights for the samples at offsets
+        -1, 0, +1, +2 from the floor index.
+    """
     t2 = t * t
     t3 = t2 * t
     w0 = (1 - 3*t + 3*t2 - t3) / 6
@@ -176,6 +273,7 @@ def cubic_weights_bspline(t: torch.Tensor):
 
 
 def _reflect_indices(i: torch.Tensor, n: int) -> torch.Tensor:
+    """Mirror integer indices into [0, n-1] without repeating the edge sample (period 2(n-1))."""
     if n <= 1:
         return torch.zeros_like(i)
     period = 2 * (n - 1)
@@ -185,6 +283,7 @@ def _reflect_indices(i: torch.Tensor, n: int) -> torch.Tensor:
 
 
 def _wrap_indices(i: torch.Tensor, n: int) -> torch.Tensor:
+    """Wrap integer indices periodically into [0, n-1]."""
     if n <= 1:
         return torch.zeros_like(i)
     r = torch.remainder(i, n)
@@ -197,6 +296,30 @@ def sample_mri_cubic_3d(
     kernel: str = "catmull-rom",
     padding_mode: str = "zeros",   # "zeros" | "reflect" | "wrap" | "border"
 ):
+    """Sample a 3D volume with a separable cubic kernel at voxel positions.
+
+    Each point uses the 4x4x4 neighbourhood around its floor index, weighted
+    by the tensor product of 1D cubic weights. The result is differentiable
+    with respect to P_vox_xyz through the weights. Out-of-range taps are
+    handled by padding_mode:
+        "zeros": taps outside the volume contribute 0 (weights are not
+            renormalised, so values fade near the border);
+        "reflect": mirrored indices (edge sample not repeated);
+        "wrap": periodic indices;
+        "border": indices clamped to the edge voxel.
+
+    Args:
+        vol_1_1_zyx: volume tensor [1, 1, Z, Y, X].
+        P_vox_xyz: [H, W, 3] sample positions in voxel index units, in
+            (x, y, z) order (x indexes X, z indexes Z); same device as the
+            volume.
+        kernel: "catmull-rom" (aliases "catmullrom", "keys") or "bspline"
+            (alias "b-spline").
+        padding_mode: "zeros", "reflect", "wrap" or "border".
+
+    Returns:
+        Tensor [1, 1, H, W] of sampled values.
+    """
     assert vol_1_1_zyx.ndim == 5 and vol_1_1_zyx.shape[:2] == (1,1)
     vol = vol_1_1_zyx[0, 0]
     Z, Y, X = vol.shape
@@ -240,6 +363,7 @@ def sample_mri_cubic_3d(
         zi_i = torch.clamp(zi, 0, Z - 1)
         mask64 = None
     elif pm == "zeros":
+        # Wrap only to keep the gather in bounds; out-of-range taps are zeroed by mask64.
         xi_i = _wrap_indices(xi, X); yi_i = _wrap_indices(yi, Y); zi_i = _wrap_indices(zi, Z)
         in_x = (xi >= 0) & (xi < X)
         in_y = (yi >= 0) & (yi < Y)
@@ -249,6 +373,7 @@ def sample_mri_cubic_3d(
     else:
         raise ValueError("padding_mode must be 'zeros', 'reflect', 'wrap', or 'border'")
 
+    # Tensor-product 4x4x4 neighbourhood per point, flattened to 64 taps (z, y, x order).
     z3 = zi_i[:, :, None, None].expand(-1, 4, 4, 4)
     y3 = yi_i[:, None, :, None].expand(-1, 4, 4, 4)
     x3 = xi_i[:, None, None, :].expand(-1, 4, 4, 4)

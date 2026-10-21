@@ -1,4 +1,11 @@
-"""Quality-control figures."""
+"""Quality-control figures for each stage of the registration.
+
+Covers the prepared images (preprocessing), patch matches and the ROI plane
+(matching / canvas), the histology and MRI on the fitted sheet (refinement)
+and the MRI mapped back onto full-resolution histology (inverse). Volumes are
+indexed (z, y, x); match points are MRI voxel indices (z, y, x). Figures are
+shown with matplotlib and saved only when a path is given.
+"""
 import numpy as np
 import SimpleITK as sitk
 import matplotlib.pyplot as plt
@@ -10,6 +17,21 @@ from .sampling import apply_lut_monotone, make_monotone_lut, robust01
 
 
 def show_proc_image(img, mask, title, idx=0, save_file=None):
+    """Show one slice of a prepared image and its mask.
+
+    The image is set to 0 outside the mask. The figure has two panels, the
+    masked image and the mask, both flipped vertically for display. If
+    ``save_file`` is given, only the masked image panel is saved, as a
+    separate figure at 300 dpi.
+
+    Args:
+        img: Prepared image (SimpleITK image, 3D).
+        mask: Its mask (SimpleITK image, same size).
+        title: Label used in the panel titles (e.g. "Histo", "MRI").
+        idx: Index of the slice along the first array axis (z).
+        save_file: Optional output path for the image panel; its directory is
+            created if needed.
+    """
     arr_img = sitk.GetArrayFromImage(img)[idx]
     arr_mask = sitk.GetArrayFromImage(mask)[idx]
 
@@ -26,7 +48,6 @@ def show_proc_image(img, mask, title, idx=0, save_file=None):
     plt.tight_layout()
     plt.show()
 
-    # Save figure
     if save_file is not None:
         os.makedirs(os.path.dirname(save_file), exist_ok=True)
 
@@ -42,8 +63,6 @@ def show_proc_image(img, mask, title, idx=0, save_file=None):
         print(f"Saved histology image to: {save_file}")
 
 
-# Visualization Debugger
-
 def show_matched_pairs(
     matches,
     hist_img,
@@ -56,6 +75,30 @@ def show_matched_pairs(
     hist_mask=None,
     mri_mask=None,
 ):
+    """Plot a grid of matched histology/MRI patch pairs.
+
+    Only matches with a valid MRI position (z >= 0) are shown, by default
+    sorted by descending score. Each pair has a histology patch (title:
+    histology index and center), the MRI patch from slice z (title: MRI
+    center and score) and, if both masks are given, the overlap of the two
+    patch masks (title: fraction of overlapping pixels). Patches are flipped
+    vertically for display. The figure is saved at 200 dpi if ``save_file``
+    is given.
+
+    Args:
+        matches: List of match dicts (uses ``hist_topleft_yx``,
+            ``mri_topleft_zyx``, ``hist_center_yx``, ``mri_center_zyx``,
+            ``hist_index`` and ``score``).
+        hist_img: Histology array [H, W] used for matching.
+        mri_img: MRI slab array [Z, Y, X] used for matching.
+        patch: Patch size in pixels (same for histology and MRI).
+        ncols: Number of pairs per row.
+        max_pairs: Optional maximum number of pairs to show.
+        sort_by_score: Sort pairs by descending score.
+        save_file: Optional output path.
+        hist_mask: Optional histology mask [H, W].
+        mri_mask: Optional MRI mask [Z, Y, X].
+    """
     vals = [m for m in matches if m["mri_center_zyx"][0] >= 0]
     if len(vals) == 0:
         print("No valid matches.")
@@ -133,6 +176,16 @@ def show_matched_pairs(
 
 
 def fit_plane_z_ax_by_c(pts_zyx, weights=None):
+    """Fit the plane z = a*x + b*y + c to points by (weighted) least squares.
+
+    Args:
+        pts_zyx: Array [N, 3] of points as (z, y, x), e.g. MRI voxel indices.
+        weights: Optional non-negative weights [N]; the residuals are weighted
+            by sqrt(weight), with weights clipped below at 1e-8.
+
+    Returns:
+        Tuple (a, b, c) of floats.
+    """
     z = pts_zyx[:, 0].astype(np.float64)
     y = pts_zyx[:, 1].astype(np.float64)
     x = pts_zyx[:, 2].astype(np.float64)
@@ -150,6 +203,7 @@ def fit_plane_z_ax_by_c(pts_zyx, weights=None):
 
 
 def _to_zyx_volume(vol):
+    """Return a SimpleITK image or array as a float32 array [Z, Y, X] (2D input gets Z=1)."""
     if sitk is not None and isinstance(vol, sitk.Image):
         arr = sitk.GetArrayFromImage(vol)  # [Z,Y,X]
     else:
@@ -162,6 +216,7 @@ def _to_zyx_volume(vol):
 
 
 def _make_xz_canvas(vol_zyx, z_min, z_max, mode="mip"):
+    """Project the z band [z_min, z_max] over y (max or mean) into a [Z, X] image (0 elsewhere)."""
     Z, Y, X = vol_zyx.shape
     z_min = int(max(0, z_min))
     z_max = int(min(Z - 1, z_max))
@@ -178,6 +233,7 @@ def _make_xz_canvas(vol_zyx, z_min, z_max, mode="mip"):
 
 
 def _make_yz_canvas(vol_zyx, z_min, z_max, mode="mip"):
+    """Project the z band [z_min, z_max] over x (max or mean) into a [Z, Y] image (0 elsewhere)."""
     Z, Y, X = vol_zyx.shape
     z_min = int(max(0, z_min))
     z_max = int(min(Z - 1, z_max))
@@ -208,15 +264,41 @@ def visualize_roi_from_matches(
     figsize=(18, 5),
     save_file=None,
 ):
+    """Plot match centers in the MRI volume with a fitted plane and XZ/YZ projections.
+
+    Valid match centers inside [z_min, z_max] are collected (randomly
+    subsampled to ``max_points`` if needed) and a plane z = a*x + b*y + c is
+    fitted to them, weighted by min-max normalized score if
+    ``use_score_weight``. This plane is for display only. One figure with
+    three panels, points colored by score:
+
+    - 3D scatter of the centers with the fitted plane (clipped to [0, Z-1]).
+    - XZ view: centers over the projection of the z band along y.
+    - YZ view: centers over the projection of the z band along x.
+
+    Projections are maximum ("mip") or mean ("mean") intensity, rescaled to
+    the 1st-99th percentile. The figure is saved at 200 dpi if ``save_file``
+    is given, and the plane equation is printed.
+
+    Args:
+        matches: List of match dicts (uses ``mri_center_zyx`` and ``score_key``).
+        mri_vol: MRI volume, SimpleITK image or array [Z, Y, X].
+        z_min: Lower z index of the band (default 0).
+        z_max: Upper z index of the band (default Z-1).
+        score_key: Key of the match score.
+        max_points: Maximum number of points plotted.
+        plane_stride: Grid spacing in voxels of the plotted plane mesh.
+        mode: Projection type for the XZ/YZ backgrounds, "mip" or "mean".
+        elev: Elevation of the 3D view in degrees.
+        azim: Azimuth of the 3D view in degrees.
+        use_score_weight: Weight the plane fit by normalized score.
+        figsize: Figure size in inches.
+        save_file: Optional output path.
+
+    Returns:
+        dict with plane coefficients ``a``, ``b``, ``c`` and ``n_points``, or
+        None if fewer than 3 valid points are available.
     """
-    One figure, 3 columns:
-      [0] 3D points + fitted plane
-      [1] XZ overlay
-      [2] YZ overlay
-    """
-    # expects your existing helpers:
-    # _to_zyx_volume, _extract_match_points, _fit_plane_z_eq_ax_by_c,
-    # _make_xz_canvas, _make_yz_canvas
     vol = _to_zyx_volume(mri_vol)  # [Z,Y,X]
     Z, Y, X = vol.shape
 
@@ -236,7 +318,7 @@ def visualize_roi_from_matches(
         idx = np.random.choice(len(pts), max_points, replace=False)
         pts, sc = pts[idx], sc[idx]
 
-    # weighted plane fit
+    # Score-weighted plane fit (weights = scores min-max normalized to [0, 1]).
     w = None
     if use_score_weight:
         s = sc - np.min(sc)
@@ -287,7 +369,7 @@ def visualize_roi_from_matches(
     ax2.set_xlabel("Y"); ax2.set_ylabel("Z")
     ax2.set_title(f"YZ overlay ({mode})")
 
-    # one shared colorbar
+    # One colorbar shared by all three panels.
     fig.colorbar(p2, ax=[ax0, ax1, ax2], shrink=0.8, label=score_key)
 
     if save_file is not None:
@@ -314,6 +396,31 @@ def plot_mri_on_sheet(
     checker_tile=24,
     flip_display=False,
 ):
+    """Plot the histology and the MRI on the refined sheet side by side.
+
+    Both images live on the sheet (common-canvas) grid. They are set to 0
+    outside ``valid_display`` and optionally flipped vertically. Panels:
+    histology on the sheet, the valid display mask, the MRI sampled on the
+    final sheet, and (if ``show_checker``) a checkerboard of the two images,
+    each min-max normalized. The figure is saved at 300 dpi to ``save_file``;
+    ``save_file_single`` saves the MRI panel alone.
+
+    Args:
+        hist_on_init_tps: Histology resampled on the initial surface (G plus
+            residual TPS), array/tensor/SimpleITK image [H, W] or [1, H, W].
+        valid_display: Display mask of the same shape (> 0.5 is valid).
+        mri_on_final_sheet: MRI sampled on the refined sheet, same shape.
+        save_file: Optional output path for the full figure.
+        save_file_single: Optional output path for the MRI-only image.
+        show_checker: Add the checkerboard panel.
+        checker_tile: Checkerboard tile size in pixels.
+        flip_display: Flip all images vertically before display.
+
+    Returns:
+        Tuple (h_disp, v_float, r_disp, v): masked (and possibly flipped)
+        histology [H, W], the valid mask as float32 [H, W], the masked MRI
+        [H, W], and the valid mask as bool [H, W].
+    """
 
     def _to_numpy(x):
         if isinstance(x, sitk.Image):
@@ -407,7 +514,15 @@ def plot_mri_on_sheet(
 
 
 def normalize_image(img, eps=1e-8):
-    """Normalize image to [0, 1]."""
+    """Min-max normalize an image to [0, 1].
+
+    Args:
+        img: Image array of any shape.
+        eps: Small constant added to the denominator.
+
+    Returns:
+        float32 array of the same shape.
+    """
     img = img.astype(np.float32)
     min_val = img.min()
     max_val = img.max()
@@ -415,14 +530,23 @@ def normalize_image(img, eps=1e-8):
 
 
 def make_checkerboard(a, b, tile_size=32):
-    """
-    Create a checkerboard composite of two normalized images.
-    Both must have the same shape.
+    """Build a checkerboard composite of two images after min-max normalization.
+
+    Args:
+        a: 2D image [H, W]; fills the tiles with odd (row + column) tile index.
+        b: 2D image of the same shape; fills the other tiles, including the
+            tile at array index (0, 0).
+        tile_size: Tile size in pixels.
+
+    Returns:
+        float32 array [H, W] in [0, 1].
+
+    Raises:
+        ValueError: If the shapes differ.
     """
     if a.shape != b.shape:
         raise ValueError(f"Shape mismatch: {a.shape} vs {b.shape}")
 
-    # Normalize both images
     a_norm = normalize_image(a)
     b_norm = normalize_image(b)
 
@@ -435,8 +559,30 @@ def make_checkerboard(a, b, tile_size=32):
     return out
 
 
-# Precheck: visualize sampled mri on histology space
 def plot_mri_on_histology(mri_on_histo, Ih_hr, Mh_hr, tile_size=384, save_file=None, save_file_single=None):
+    """Plot the MRI resampled onto the HR histology grid next to the histology.
+
+    All images are flipped vertically and multiplied by the histology mask.
+    The 2x3 figure shows:
+
+    - Top row: masked histology, masked MRI, and their checkerboard (each
+      min-max normalized).
+    - Bottom row: histology intensity-mapped to the MRI by a monotone
+      quantile LUT, MRI rescaled to [0, 1] by its 1st-99th percentile, and
+      their checkerboard. The percentiles and the LUT are computed over the
+      whole image, including the zeroed background.
+
+    The figure is saved at 300 dpi if ``save_file`` is given;
+    ``save_file_single`` saves the masked MRI panel alone.
+
+    Args:
+        mri_on_histo: MRI resampled on the HR histology grid, array [H, W].
+        Ih_hr: HR grayscale histology (SimpleITK image, single slice).
+        Mh_hr: HR histology mask (SimpleITK image, single slice).
+        tile_size: Checkerboard tile size in HR pixels.
+        save_file: Optional output path for the full figure.
+        save_file_single: Optional output path for the MRI-only image.
+    """
     fig, axes = plt.subplots(2, 3, figsize=(20, 12))
     axes = axes.ravel()
 
@@ -447,7 +593,7 @@ def plot_mri_on_histology(mri_on_histo, Ih_hr, Mh_hr, tile_size=384, save_file=N
     mri_disp  = np.flipud(mri_on_histo).astype(np.float32)
     mask_disp = np.flipud(arr_Mh_hr).astype(np.float32)
 
-    # keep same behavior as final-check style, but in histology support
+    # Restrict both images to the histology mask.
     hist_disp = hist_disp * mask_disp
     mri_disp  = mri_disp * mask_disp
 
@@ -518,6 +664,37 @@ def plot_mri_on_histology_rgb(
     save_file=None,
     flip_display=False,
 ):
+    """Plot the MRI on the HR histology grid against grayscale and RGB histology.
+
+    Inside the optional mask, histology and MRI are rescaled to [0, 1] by
+    their ``pclip`` percentiles, and the grayscale histology is mapped to the
+    MRI intensity distribution with a monotone quantile LUT. Pixels outside
+    the mask are shown white. The 2x3 figure shows:
+
+    - Top row: LUT-mapped histology, rescaled MRI, and their checkerboard.
+    - Bottom row: RGB histology, rescaled MRI, and a checkerboard of RGB
+      histology and MRI.
+
+    In both checkerboards the tile at array index (0, 0) shows histology.
+    Images are drawn with ``origin="lower"`` and optionally flipped
+    vertically first.
+    The figure is saved at 300 dpi if ``save_file`` is given.
+
+    Args:
+        arr_Ih_hr: HR grayscale histology, [H, W] or singleton 3D, array or
+            SimpleITK image.
+        arr_Ih_rgb_hr: HR RGB histology, array [H, W, 3] (0-255 or 0-1).
+        mri_clean: MRI resampled on the HR histology grid, [H, W].
+        arr_Mh_hr: Optional HR histology mask, [H, W] (> 0 is tissue).
+        tile: Checkerboard tile size in HR pixels.
+        pclip: Lower/upper percentiles for intensity rescaling.
+        n_quant: Number of quantiles for the LUT.
+        save_file: Optional output path.
+        flip_display: Flip all images vertically before display.
+
+    Raises:
+        ValueError: If the shapes of the inputs do not agree.
+    """
     def _to_np(x):
         if isinstance(x, sitk.Image):
             return sitk.GetArrayFromImage(x)
@@ -637,12 +814,13 @@ def plot_mri_on_histology_rgb(
 
 
 def _plot_surface(z_tensor, title, save_file=None):
+    """Plot a 2D tensor [H, W] as a 3D height surface; save at 300 dpi if ``save_file`` is given."""
     z = z_tensor.detach().cpu().numpy()          # (H, W)
     ys, xs = np.mgrid[0:z.shape[0], 0:z.shape[1]]
     fig = plt.figure(figsize=(8, 6))
     ax = fig.add_subplot(111, projection="3d")
 
-    # light red fill, no colormap; thin red wire for shape
+    # Translucent red fill with a thin red wireframe to show the shape.
     surf = ax.plot_surface(
         xs, ys, z,
         color=(0.95, 0.45, 0.45, 0.35),  # RGBA (soft red, 35% opaque)
@@ -655,7 +833,6 @@ def _plot_surface(z_tensor, title, save_file=None):
     ax.set_title(title)
     plt.tight_layout()
 
-    # Save figure
     if save_file is not None:
         os.makedirs(os.path.dirname(save_file), exist_ok=True)
         fig.savefig(save_file, dpi=300, bbox_inches="tight")

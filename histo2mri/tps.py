@@ -1,4 +1,12 @@
-"""Thin-plate-spline surfaces and maps, robust (RANSAC/MAD) TPS fitting, and residual TPS on top of G."""
+"""Thin-plate-spline (TPS) models built on top of the global plane G.
+
+Provides a 3D TPS surface (u, v) -> MRI (x, y, z) and a 2D TPS map (u, v) -> (x, y), a
+robust (RANSAC / MAD) TPS fit to the patch matches, residual TPS fits on top of G, and
+resampling of the histology onto the initial surface before refinement. (u, v) are the
+plane coordinates of G in MRI voxels, MRI positions are (x, y, z) voxels of the slab, and
+histology positions are (x, y) pixels of the common canvas. Matches store MRI points as
+(z, y, x) and histology points as (y, x).
+"""
 import numpy as np
 import SimpleITK as sitk
 from scipy.spatial import cKDTree
@@ -9,19 +17,31 @@ from typing import Tuple
 from .plane import hist_xy_from_G_uv, xyz_from_G_uv
 
 
-# Init DDF
-
-# 2D TPS Helper
-# reuse the same kernel as pose_estimation_v6.py
 def _tps_kernel_r2logr_2d(r2, eps=1e-9):
+    """2D-map TPS kernel r2 * log(r + eps), with r = sqrt(max(r2, eps)); 0 at r2 = 0.
+
+    Unlike ``_tps_kernel_r2logr`` (3D surface) it adds eps inside the log and has no explicit
+    zeroing at r2 = 0. The values differ slightly, so the two kernels are not interchangeable.
+    """
     r = torch.sqrt(torch.clamp(r2, min=eps))
     return r2 * torch.log(r + eps)
 
 
 class ThinPlateSplineMap2D(nn.Module):
-    """
-    Vector TPS map M(u,v) = [x(u,v), y(u,v)].
-    Fits from uv -> xy.
+    """Vector-valued 2D TPS map M(u, v) = [x(u, v), y(u, v)].
+
+    Each output component is an affine term plus a weighted sum of TPS kernels centred on
+    the control points. Uses ``_tps_kernel_r2logr_2d``, which is numerically different
+    from the kernel of ``ThinPlateSplineSurface3D``. In the pipeline it models the
+    histology-pixel residual of G (see ``fit_residual_tps2d``).
+
+    Args:
+        device: torch device of the fitted parameters.
+        dtype: torch dtype of the fitted parameters.
+
+    Call ``fit_from_uv_xy`` before use. ``forward(uv_query)`` takes an (M, 2) tensor of
+    (u, v) in the units of the control points and returns an (M, 2) tensor of (x, y) in
+    the units of the targets.
     """
     def __init__(self, device=None, dtype=torch.float32):
         super().__init__()
@@ -40,6 +60,22 @@ class ThinPlateSplineMap2D(nn.Module):
         self.lam = 0.0
 
     def fit_from_uv_xy(self, ctrl_uv, targets_xy, lam=0.0, normalize_uv=False):
+        """Fit the map to control points by solving the regularised TPS system.
+
+        Control points closer than 1e-5 in (u, v) are merged and their targets averaged.
+        The kernel diagonal is damped by lam (at least 1e-6); if the solve fails, lam is
+        raised by factors of 10 up to 1000x, and a least-squares solve is the last resort.
+        The lam actually used is stored in ``self.lam``.
+
+        Args:
+            ctrl_uv: (N, 2) control-point parameters (u, v), N >= 3.
+            targets_xy: (N, 2) target values (x, y) at the control points.
+            lam: smoothing (ridge) weight on the kernel matrix.
+            normalize_uv: standardise (u, v) by the control-point mean and std first.
+
+        Returns:
+            self, fitted.
+        """
         ctrl_uv = torch.as_tensor(ctrl_uv, dtype=self._dtype, device=self._device)
         targets_xy = torch.as_tensor(targets_xy, dtype=self._dtype, device=self._device)
 
@@ -156,6 +192,26 @@ class ThinPlateSplineMap2D(nn.Module):
 
 
 def uv_support_confidence(uv_flat, ctrl_uv, Hout, Wout, sigma_uv=20.0, min_conf=0.25, hard_mult=2.0):
+    """Compute how well each query (u, v) is supported by nearby control points.
+
+    With d the distance to the nearest control point, the confidence is
+    g = exp(-d^2 / (2 sigma_uv^2)), rescaled so that g = min_conf maps to 0 and g = 1 to 1,
+    clipped to [0, 1], squared, and set to 0 where d > hard_mult * sigma_uv. It is used to
+    fade the TPS residual back to G away from the matches.
+
+    Args:
+        uv_flat: (Hout*Wout, 2) query (u, v), in the same units as ctrl_uv.
+        ctrl_uv: (N, 2) control-point (u, v), numpy array or torch tensor.
+        Hout: output grid height.
+        Wout: output grid width.
+        sigma_uv: Gaussian width in (u, v) units.
+        min_conf: Gaussian value that is mapped to confidence 0.
+        hard_mult: distance cut-off in multiples of sigma_uv.
+
+    Returns:
+        Tuple (conf, d): conf is an (Hout, Wout) float32 array in [0, 1]; d is the
+        (Hout, Wout) nearest-control distance.
+    """
     cuv = ctrl_uv.detach().cpu().numpy() if torch.is_tensor(ctrl_uv) else np.asarray(ctrl_uv, np.float32)
     tree = cKDTree(cuv.astype(np.float32))
     d, _ = tree.query(np.asarray(uv_flat, np.float32), k=1)
@@ -180,6 +236,32 @@ def fit_residual_tps3d(
     max_anchors=1200,
     seed=42,
 ):
+    """Fit a 3D TPS to the MRI residual of the matches with respect to the plane G.
+
+    The targets are dxyz = xyz_ctrl - G(uv_ctrl). Zero-residual anchors from
+    ``build_G_anchors_uv_xyz`` are added where the matches are sparse, so the residual
+    decays to zero (the surface falls back to G) instead of extrapolating far from the
+    data. The full surface is G(uv) + tps_res(uv) (see ``ResidualToGSurface3D``).
+
+    Args:
+        uv_ctrl: (N, 2) plane coordinates of the matches, numpy array or tensor.
+        xyz_ctrl: (N, 3) matched MRI (x, y, z) in voxels.
+        G: global plane dict from ``plane.fit_global_plane``.
+        device: torch device for the TPS.
+        lam: TPS smoothing weight.
+        normalize_uv: standardise (u, v) before fitting.
+        anchor_step: spacing of the anchor grid in (u, v) voxels.
+        far_thr: minimum distance in (u, v) from any match for an anchor to be kept.
+        max_anchors: maximum number of anchors (random subset if exceeded).
+        seed: seed of the anchor subsampling.
+
+    Returns:
+        Tuple (tps_res, uv_all, dxyz_all, uv_anchor):
+            tps_res: fitted ``ThinPlateSplineSurface3D`` mapping (u, v) -> dxyz in voxels.
+            uv_all: (N + M, 2) float32 control (u, v), matches followed by anchors.
+            dxyz_all: (N + M, 3) float32 residual targets (zeros for the anchors).
+            uv_anchor: (M, 2) float32 anchor (u, v).
+    """
     uv_np = uv_ctrl.detach().cpu().numpy() if torch.is_tensor(uv_ctrl) else np.asarray(uv_ctrl, np.float32)
     xyz_np = xyz_ctrl.detach().cpu().numpy() if torch.is_tensor(xyz_ctrl) else np.asarray(xyz_ctrl, np.float32)
 
@@ -219,6 +301,31 @@ def fit_residual_tps2d(
     max_anchors=1200,
     seed=42,
 ):
+    """Fit a 2D TPS to the histology residual of the matches with respect to G.
+
+    The targets are dxy = hist_xy_ctrl - G_hist(uv_ctrl), where G_hist is the in-plane
+    similarity of G (``plane.hist_xy_from_G_uv``). Zero-residual anchors from
+    ``build_G_anchors_uv_xyz`` keep the map close to G away from the matches.
+
+    Args:
+        uv_ctrl: (N, 2) plane coordinates of the matches, numpy array or tensor.
+        hist_xy_ctrl: (N, 2) matched histology (x, y) in common-canvas pixels.
+        G: global plane dict from ``plane.fit_global_plane``.
+        device: torch device for the TPS.
+        lam: TPS smoothing weight.
+        normalize_uv: standardise (u, v) before fitting.
+        anchor_step: spacing of the anchor grid in (u, v) voxels.
+        far_thr: minimum distance in (u, v) from any match for an anchor to be kept.
+        max_anchors: maximum number of anchors (random subset if exceeded).
+        seed: seed of the anchor subsampling.
+
+    Returns:
+        Tuple (tps2d_res, uv_all, dxy_all, uv_anchor):
+            tps2d_res: fitted ``ThinPlateSplineMap2D`` mapping (u, v) -> dxy in pixels.
+            uv_all: (N + M, 2) float32 control (u, v), matches followed by anchors.
+            dxy_all: (N + M, 2) float32 residual targets (zeros for the anchors).
+            uv_anchor: (M, 2) float32 anchor (u, v).
+    """
     uv_np = uv_ctrl.detach().cpu().numpy() if torch.is_tensor(uv_ctrl) else np.asarray(uv_ctrl, np.float32)
     hist_xy_np = hist_xy_ctrl.detach().cpu().numpy() if torch.is_tensor(hist_xy_ctrl) else np.asarray(hist_xy_ctrl, np.float32)
 
@@ -262,6 +369,41 @@ def resample_histology_on_surface(
     max_residual_px=20.0,
     return_extra=False,
 ):
+    """Resample the histology onto the plane grid of G using G plus the 2D TPS residual.
+
+    For each output pixel with plane coordinates (u, v), the histology position is
+    G_hist(u, v) + conf(u, v) * dxy(u, v), where dxy is the residual TPS clamped to a
+    length of ``max_residual_px`` and conf is ``uv_support_confidence`` (the residual fades
+    out away from the matches). The image is then sampled with ``grid_sample``.
+
+    The output grid is either the plane grid of G (``canvas_shape=None``) or a canvas of
+    ``canvas_shape`` in which the plane grid starts at row/column ``common_shift_yx``
+    (centred if None). Pixels outside the plane range of G or outside the histology are
+    marked invalid.
+
+    Args:
+        hist_img: 2D histology image (SimpleITK image or array, (H, W) or (1, H, W)) in
+            the frame that G maps to, in the pipeline the common canvas.
+        G: global plane dict from ``plane.fit_global_plane``.
+        tps2d_residual: residual map from ``fit_residual_tps2d``.
+        ctrl_uv: (N, 2) (u, v) of the matches, used for the support confidence.
+        device: torch device.
+        canvas_shape: optional (Hc, Wc) of the output canvas.
+        common_shift_yx: optional (oy, ox) of the plane grid inside the canvas.
+        fill_invalid: value for invalid pixels; None keeps the sampled values.
+        is_mask: use nearest-neighbour sampling and threshold the result at 0.5.
+        sigma_uv: see ``uv_support_confidence``.
+        min_conf: see ``uv_support_confidence``.
+        hard_mult: see ``uv_support_confidence``.
+        max_residual_px: maximum length of the TPS residual, in histology pixels.
+        return_extra: also return the intermediate maps.
+
+    Returns:
+        hist_out, an (Hout, Wout) float32 array. With ``return_extra=True``, the tuple
+        (hist_out, valid, uv, xy, conf, dmin): valid is an (Hout, Wout) bool mask, uv the
+        (Hout, Wout, 2) plane coordinates, xy the (Hout, Wout, 2) sampled histology
+        (x, y), conf the support confidence and dmin the nearest-match distance in (u, v).
+    """
     if isinstance(hist_img, sitk.Image):
         h = sitk.GetArrayFromImage(hist_img)
     else:
@@ -358,10 +500,67 @@ def fit_tps_robust(
     lam_final: float = 5e-3,
     normalize_uv: bool = False,
 ):
+    """Robustly fit a 3D TPS surface (u, v) -> MRI (x, y, z) to the patch matches.
+
+    The histology point of each match is mapped to plane coordinates by inverting the
+    in-plane similarity of G, uv = (hist_xy - t_xy) @ A2_invT, and the MRI point is the
+    target. Outlier matches are then rejected with one of three methods:
+
+    * ``"ransac"``: fit TPS hypotheses (smoothing ``lam_hyp``) on random subsets of
+      ``sample_size`` matches; a match is an inlier if its 3D residual is
+      <= ``inlier_thresh`` voxels. Hypotheses with fewer than ``min_inliers`` inliers are
+      ignored. Hypotheses are scored by the inlier count or by the negative truncated
+      residual sum (``score_type="truncated"``). Stops early when a new best hypothesis has
+      more than 90% inliers. Falls back to all matches if no hypothesis is valid.
+    * ``"mad"``: fit on all matches, then up to ``mad_iterations`` times keep matches with
+      residual <= median + mad_thresh * 1.4826 * MAD and refit; stops when the set does
+      not change or would have fewer than 3 matches.
+    * ``"all"``: keep every match.
+
+    The final surface is refitted on the inliers with smoothing ``lam_final``.
+
+    Args:
+        matches_filtered: list of match dicts. Histology points must be in the frame G
+            was fitted in (the common canvas in the pipeline).
+        G: global plane dict; needs ``t_xy`` and one of ``A2_invT``, ``A2`` or (``s``,
+            ``R2``).
+        device: torch device.
+        hist_key: match key of the histology point, (y, x).
+        mri_key: match key of the MRI point, (z, y, x); (-1, -1, -1) entries are skipped.
+        method: ``"ransac"``, ``"mad"`` or ``"all"``.
+        n_iters: number of RANSAC hypotheses.
+        sample_size: matches per RANSAC hypothesis.
+        inlier_thresh: RANSAC inlier threshold, in MRI voxels.
+        min_inliers: minimum inlier count for a RANSAC hypothesis to be scored.
+        score_type: ``"inliers"`` or ``"truncated"``.
+        truncated_cap: residual cap, in voxels, for ``score_type="truncated"``.
+        seed: seed of the RANSAC sampler.
+        mad_thresh: number of robust standard deviations above the median for MAD.
+        mad_iterations: maximum number of MAD reject-refit rounds (at least 1).
+        lam_hyp: TPS smoothing for RANSAC hypotheses and MAD rounds.
+        lam_final: TPS smoothing for the final refit.
+        normalize_uv: standardise (u, v) before each TPS fit.
+
+    Returns:
+        Tuple (tps_final, uv_in, xyz_in, inlier_mask, residuals, best_score):
+            tps_final: ``ThinPlateSplineSurface3D`` fitted on the inliers.
+            uv_in: (K, 2) inlier (u, v) tensor.
+            xyz_in: (K, 3) inlier MRI (x, y, z) tensor.
+            inlier_mask: (N,) bool tensor over the valid matches, in input order (aligned
+                with the input list only if every match is valid).
+            residuals: (N,) 3D residuals of tps_final at all valid matches, in voxels.
+            best_score: inlier count for "mad" and "all"; for "ransac" the best score
+                (int or negative float), or None if no hypothesis was valid.
+
+    Raises:
+        ValueError: if fewer than 3 valid matches, fewer than ``sample_size`` for RANSAC,
+            or an unknown method or score type is given.
+        KeyError: if G lacks the in-plane transform keys.
+    """
     print(f"\n-------- Estimate Initial Curved Sheet (method={method}) --------")
     device = torch.device(device)
 
-    # build controls from matches + G
+    # Control points: histology (x, y) mapped to (u, v) through G, and MRI (x, y, z).
     pts_hist_xy, pts_xyz = [], []  # hist (x,y), MRI (x,y,z)
     for m in matches_filtered:
         if hist_key not in m or mri_key not in m:
@@ -494,6 +693,20 @@ def fit_tps_robust(
 
 
 class ResidualToGSurface3D(torch.nn.Module):
+    """Absolute surface S(u, v) = G(u, v) + residual_tps(u, v) in MRI voxels.
+
+    Combines the plane of G with a residual TPS from ``fit_residual_tps3d``. The
+    evaluation goes through numpy on the CPU, so no gradients flow through it.
+
+    Args:
+        G: global plane dict from ``plane.fit_global_plane``.
+        residual_tps: callable (M, 2) tensor -> (M, 3) residual, e.g. the
+            ``ThinPlateSplineSurface3D`` from ``fit_residual_tps3d``.
+        device: stored as ``self.device``; the output is placed on the device of the input.
+
+    ``forward(uv_query)`` takes an (M, 2) tensor of (u, v) and returns an (M, 3) float32
+    tensor of MRI (x, y, z) voxels.
+    """
     def __init__(self, G, residual_tps, device="cuda:0"):
         super().__init__()
         self.G = G
@@ -508,7 +721,6 @@ class ResidualToGSurface3D(torch.nn.Module):
         return torch.from_numpy(xyz).to(device=uv_query.device, dtype=torch.float32)
 
 
-# --- refit TPS with G-plane anchors (prevents swirl/extrapolation) ---
 def build_G_anchors_uv_xyz(
     uv_ctrl,                 # [N,2] uv used by TPS fit
     G,
@@ -517,6 +729,24 @@ def build_G_anchors_uv_xyz(
     max_anchors=1200,
     seed=42,
 ):
+    """Build anchor points on the plane of G in regions without matches.
+
+    Anchors lie on a regular (u, v) grid over the plane range of G and are kept only if
+    they are at least ``far_thr`` from every control point. Pinning a TPS to G at these
+    anchors stops it from swirling or extrapolating where there are no matches.
+
+    Args:
+        uv_ctrl: (N, 2) control-point (u, v), numpy array or tensor.
+        G: global plane dict (uses x_range, y_range, X0, e1, e2).
+        anchor_step: grid spacing in (u, v) voxels.
+        far_thr: minimum distance to the nearest control point, in (u, v) voxels.
+        max_anchors: if more anchors remain, keep a random subset of this size.
+        seed: seed of the random subset.
+
+    Returns:
+        Tuple (uv_anchor, xyz_anchor): (M, 2) float32 anchor (u, v) and (M, 3) float32
+        MRI (x, y, z) of the anchors on the plane of G.
+    """
     uv = uv_ctrl.detach().cpu().numpy() if torch.is_tensor(uv_ctrl) else np.asarray(uv_ctrl, np.float32)
     uv = uv.astype(np.float32)
 
@@ -550,38 +780,42 @@ def build_G_anchors_uv_xyz(
 
 
 def _tps_kernel_r2logr(r2, eps=1e-9):
-    """
-    TPS kernel in terms of squared distance r^2:
-        U(r) = r^2 * log(r), with U(0) = 0.
-    We pass r^2 in for numerical stability.
+    """3D-surface TPS kernel r2 * log(r), with r = sqrt(max(r2, eps)); exactly 0 at r2 = 0.
+
+    Takes squared distances so no square root of zero is needed. Unlike
+    ``_tps_kernel_r2logr_2d`` there is no eps inside the log; the two are not interchangeable.
     """
     r = torch.clamp(r2, min=eps).sqrt()
     U = r2 * torch.log(r)
-    # ensure exact 0 at r=0
+    # Exact 0 at r = 0.
     U = torch.where(r2 > 0, U, torch.zeros_like(U))
     return U
 
 
 @torch.no_grad()
 def _tps_residuals(tps, uv_all, xyz_all):
-    """Compute residual norms for all points."""
+    """Return the (N,) Euclidean distances between tps(uv_all) and xyz_all."""
     pred = tps(uv_all)                     # (N,3)
     return (xyz_all - pred).norm(dim=1)    # (N,)
 
 
-# ============== 2) ThinPlateSplineSurface3D (PyTorch) ==============
-
 class ThinPlateSplineSurface3D(nn.Module):
-    """
-    Vector-valued TPS surface S(u,v) = [x(u,v), y(u,v), z(u,v)],
-    fit from (u,v) parameter points to (x,y,z) targets.
+    """Vector-valued TPS surface S(u, v) = [x(u, v), y(u, v), z(u, v)].
 
-    - fit_from_uv_xyz(ctrl_uv, targets_xyz, ...)  -> solves TPS system
-    - forward(uv_query)                           -> (M,3) xyz
-    - predict(U, V)                               -> (X,Y,Z) grids
-    - normals(U, V)                               -> (3, *shape) unit normals
+    Each output component is an affine term in (u, v) plus a weighted sum of TPS kernels
+    (``_tps_kernel_r2logr``) centred on the control points. In the pipeline the targets
+    are either absolute MRI positions (``fit_tps_robust``) or residuals to G
+    (``fit_residual_tps3d``), both in MRI voxels; outputs have the units of the targets.
 
-    All coordinates here are in *voxel* units (your pipeline is voxel-based).
+    Args:
+        device: torch device of the fitted parameters.
+        dtype: torch dtype of the fitted parameters.
+
+    Methods (after ``fit_from_uv_xyz``):
+        forward(uv_query): (M, 2) tensor -> (M, 3) tensor.
+        predict(U, V): broadcastable arrays -> (X, Y, Z), each of the broadcast shape.
+        partials(U, V): (S_u, S_v), each (3, *shape).
+        normals(U, V): unit normals, (3, *shape).
     """
 
     def __init__(self, device=None, dtype=torch.float32):
@@ -603,20 +837,33 @@ class ThinPlateSplineSurface3D(nn.Module):
         self.register_buffer("w_z", None, persistent=False)
         self.register_buffer("a_z", None, persistent=False)
 
-        # PCA info placeholder (not used here, but kept for completeness)
+        # Set to the identity by fit_from_uv_xyz; never read by this class.
         self.register_buffer("pca_origin", None, persistent=False)  # (3,)
         self.register_buffer("pca_axes", None, persistent=False)    # (3,3)
-
-    # ---------- Fitting from (u,v) and (x,y,z) ----------
 
     def fit_from_uv_xyz(self,
                         ctrl_uv,
                         targets_xyz,
                         lam: float = 0.0,
                         normalize_uv: bool = False):
-        """
-        Fit TPS from explicit parameter points and 3D targets.
-        Robust to duplicate uv / near-singular systems.
+        """Fit the surface to control points by solving the regularised TPS system.
+
+        Control points closer than 1e-5 in (u, v) are merged and their targets averaged.
+        The kernel diagonal is damped by lam (at least 1e-6); if the solve fails, lam is
+        raised by factors of 10 up to 1000x, and a least-squares solve is the last resort.
+        The lam actually used is stored in ``self.lam``.
+
+        Args:
+            ctrl_uv: (N, 2) control-point parameters (u, v), N >= 3.
+            targets_xyz: (N, 3) target values at the control points.
+            lam: smoothing (ridge) weight on the kernel matrix.
+            normalize_uv: standardise (u, v) by the control-point mean and std first.
+
+        Returns:
+            self, fitted.
+
+        Raises:
+            ValueError: on wrong shapes or fewer than 3 (unique) control points.
         """
         ctrl_uv = torch.as_tensor(ctrl_uv, dtype=self._dtype, device=self._device)
         targets_xyz = torch.as_tensor(targets_xyz, dtype=self._dtype, device=self._device)
@@ -655,7 +902,6 @@ class ThinPlateSplineSurface3D(nn.Module):
             if N < 3:
                 raise ValueError("Too few unique control points after deduplication.")
 
-        # no PCA here; uv are already parameter coords
         self.pca_origin = torch.zeros(3, device=device, dtype=dtype)
         self.pca_axes = torch.eye(3, device=device, dtype=dtype)
 
@@ -727,8 +973,6 @@ class ThinPlateSplineSurface3D(nn.Module):
 
         return self
 
-    # ---------- Internal helpers ----------
-
     def _normalize_uv(self, U, V) -> torch.Tensor:
         """Normalize (U,V) into (u_n, v_n) flattened to (M,2)."""
         U = torch.as_tensor(U, dtype=self._dtype, device=self.ctrl_uv.device)
@@ -768,12 +1012,14 @@ class ThinPlateSplineSurface3D(nn.Module):
 
         return val.reshape(shape)
 
-    # ---------- Forward & predict ----------
-
     def forward(self, uv_query: torch.Tensor) -> torch.Tensor:
-        """
-        uv_query : (M,2) tensor of (u,v) in same units as ctrl_uv.
-        Returns  : (M,3) xyz in voxel coordinates.
+        """Evaluate the surface at query points.
+
+        Args:
+            uv_query: (M, 2) tensor of (u, v) in the units of ``ctrl_uv``.
+
+        Returns:
+            (M, 3) tensor of (x, y, z) in the units of the targets.
         """
         if uv_query.ndim != 2 or uv_query.shape[1] != 2:
             raise ValueError("uv_query must be (M,2)")
@@ -785,19 +1031,32 @@ class ThinPlateSplineSurface3D(nn.Module):
         return torch.stack([X, Y, Z], dim=1)            # (M,3)
 
     def predict(self, U, V) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Evaluate S(U,V) -> (X,Y,Z) on a grid or broadcasted arrays.
+        """Evaluate the surface on a grid or on broadcastable arrays.
+
+        Args:
+            U: u values, array or tensor.
+            V: v values, broadcastable with U.
+
+        Returns:
+            Tuple (X, Y, Z) of tensors with the broadcast shape of U and V.
         """
         X = self._tps_eval_scalar(U, V, self.w_x, self.a_x)
         Y = self._tps_eval_scalar(U, V, self.w_y, self.a_y)
         Z = self._tps_eval_scalar(U, V, self.w_z, self.a_z)
         return X, Y, Z
 
-    # ---------- Derivatives & normals ----------
-
     def partials(self, U, V):
-        """
-        First derivatives of S wrt (U,V): returns (S_u, S_v), each (3, *shape).
+        """Compute the first derivatives of the surface with respect to u and v.
+
+        Uses the analytic kernel derivative dU/dr = 2 r log(r) + r and divides by the
+        (u, v) normalisation scale, so the derivatives are with respect to raw (u, v).
+
+        Args:
+            U: u values, array or tensor.
+            V: v values, broadcastable with U.
+
+        Returns:
+            Tuple (S_u, S_v), each a tensor of shape (3, *shape).
         """
         device = self.ctrl_uv.device
         dtype = self.ctrl_uv.dtype
@@ -857,8 +1116,14 @@ class ThinPlateSplineSurface3D(nn.Module):
         return Su, Sv
 
     def normals(self, U, V) -> torch.Tensor:
-        """
-        Surface unit normals at (U,V). Returns (3, *shape).
+        """Compute unit surface normals S_u x S_v / |S_u x S_v|.
+
+        Args:
+            U: u values, array or tensor.
+            V: v values, broadcastable with U.
+
+        Returns:
+            Tensor of shape (3, *shape); zero where the cross product vanishes.
         """
         Su, Sv = self.partials(U, V)           # (3,*shape)
 
@@ -879,12 +1144,9 @@ class ThinPlateSplineSurface3D(nn.Module):
         return N_unit.permute(dims)           # (3,*shape)
 
 
-# ============== 1) Get (uv, xyz) from matches + G ==============
-
-
 @torch.no_grad()
 def _fit_tps_on_subset(uv, xyz, idx, device, dtype, lam, normalize_uv=False):
-    """Fit TPS on subset indices idx and return fitted module."""
+    """Fit a ThinPlateSplineSurface3D on the subset uv[idx] -> xyz[idx] and return it."""
     tps = ThinPlateSplineSurface3D(device=device, dtype=dtype)
     tps.fit_from_uv_xyz(
         ctrl_uv=uv[idx],

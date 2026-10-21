@@ -1,4 +1,26 @@
-"""Map the refined surface back into high-resolution histology space."""
+"""Map the refined MRI surface back into full-resolution (HR) histology space.
+
+This is the last registration stage: after curved-sheet refinement, every
+surface pixel carries an MRI position (xyz_norm_final) and a histology position
+on the common canvas (xy_map_sym). The entry point, mri_on_histology_space(),
+resamples the MRI onto the HR histology pixel grid in three stages:
+
+  1. Compose the HR <-> common-canvas index affine from three sub-affines
+     (HR -> proc, proc -> scaled, scaled -> common); build_hr_common_affines().
+  2. Build the target-valid mask: the HR histology pixels where the surface can
+     actually deliver a sample, restricted to the tissue mask;
+     build_target_valid_mask().
+  3. Pull the MRI through densely at HR resolution, tile by tile:
+     HR pixel -> common canvas -> surface index -> xyz_norm_final -> MRI;
+     resample_mri_to_hr().
+
+All index affines are 4x4 homogeneous matrices acting on (x, y, z, 1) pixel
+indices; z is 0 for the 2D section. A_common_to_hr is a product of
+diagonal-plus-translation matrices, so its [0, 0] and [1, 1] entries are the
+x and y scales (HR pixels per common-canvas pixel). build_target_valid_mask()
+relies on this to size its smoothing kernels and prints a warning if the
+affine ever contains a rotation (off-diagonal terms).
+"""
 import numpy as np
 import torch
 import SimpleITK as sitk
@@ -15,7 +37,21 @@ from .sampling import sample_mri_cubic_3d
 
 
 def make_A_proc_to_scaled(proc_Ih, scaled_proc_Ih):
-    sx = scaled_proc_Ih.GetSize()[0] / proc_Ih.GetSize()[0]
+    """Build the proc -> scaled histology index affine.
+
+    The x and y scales are the ratios of image sizes (scaled / proc), so the
+    affine is a pure diagonal scaling about pixel index 0 with no translation.
+
+    Args:
+        proc_Ih: prepared (padded) histology, sitk.Image.
+        scaled_proc_Ih: the same image after rescaling by the best scale,
+            sitk.Image.
+
+    Returns:
+        4x4 float64 array mapping homogeneous (x, y, z, 1) proc pixel indices
+        to scaled pixel indices; z is left unchanged.
+    """
+    sx =scaled_proc_Ih.GetSize()[0] / proc_Ih.GetSize()[0]
     sy = scaled_proc_Ih.GetSize()[1] / proc_Ih.GetSize()[1]
     A = np.eye(4, dtype=np.float64)
     A[0, 0] = sx
@@ -24,7 +60,20 @@ def make_A_proc_to_scaled(proc_Ih, scaled_proc_Ih):
 
 
 def make_A_scaled_to_common(oy, ox):
-    A = np.eye(4, dtype=np.float64)
+    """Build the scaled-histology -> common-canvas index affine.
+
+    The scaled histology sits on the common canvas at offset (oy, ox), so this
+    is a pure translation.
+
+    Args:
+        oy: row offset of the histology on the common canvas (oy_h), pixels.
+        ox: column offset of the histology on the common canvas (ox_h), pixels.
+
+    Returns:
+        4x4 float64 array mapping homogeneous (x, y, z, 1) scaled pixel indices
+        to common-canvas pixel indices.
+    """
+    A =np.eye(4, dtype=np.float64)
     A[0, 3] = float(ox)  # x shift
     A[1, 3] = float(oy)  # y shift
     return A
@@ -42,6 +91,41 @@ def inverse_surface_image_to_hr(
     fill_holes=True,
     return_weight=False,
 ):
+    """Splat an image defined on the surface grid into HR histology space.
+
+    Each valid surface pixel has a common-canvas position (x, y) in
+    xy_hist_map; it is mapped to HR pixel coordinates with A_common_to_hr and
+    its value is scattered onto the HR grid. Images use a bilinear splat
+    followed by division by the accumulated weight; masks (is_mask=True) use
+    nearest-pixel assignment and are binarised (> 0). Because the surface is
+    much coarser than HR histology the splat is sparse; with fill_holes=True
+    (images only), HR pixels with no support inside target_valid_mask take the
+    value of the nearest supported pixel. Pixels outside target_valid_mask are
+    set to zero. Prints a one-line support summary.
+
+    Args:
+        img_on_surface: [Hs, Ws] values on the surface grid.
+        xy_hist_map: [Hs, Ws, 2] common-canvas coordinates of each surface
+            pixel, channel 0 = x (column), channel 1 = y (row), pixels.
+        A_common_to_hr: 4x4 affine from homogeneous (x, y, z, 1) common-canvas
+            indices to HR histology indices.
+        Ih_hr: HR histology (sitk.Image or array, [1, Hhr, Whr] or
+            [Hhr, Whr]); only its shape is used.
+        valid_mask: optional [Hs, Ws] bool; surface pixels to splat. Default:
+            all.
+        target_valid_mask: optional [Hhr, Whr] bool; HR pixels allowed to
+            receive values and to be hole-filled. Default: all.
+        is_mask: if True, treat img_on_surface as a binary mask.
+        fill_holes: if True, fill unsupported HR pixels inside
+            target_valid_mask by nearest-neighbour copy (images only).
+        return_weight: if True, also return the accumulated splat weights.
+
+    Returns:
+        out: [Hhr, Whr] float32 image in HR histology space; if return_weight
+        is True, the tuple (out, wgt), where wgt is the [Hhr, Whr] float32
+        accumulated splat weight (bilinear weights, or hit counts for masks),
+        zeroed outside target_valid_mask.
+    """
     import numpy as np
     import SimpleITK as sitk
 
@@ -102,7 +186,7 @@ def inverse_surface_image_to_hr(
     wgt = np.zeros((Hhr, Whr), dtype=np.float32)
 
     if is_mask:
-        # Nearest assignment for true binary-mask backprojection only.
+        # Masks: nearest-pixel assignment, so labels are never blended.
         xn = np.rint(xh).astype(np.int32)
         yn = np.rint(yh).astype(np.int32)
         m = (xn >= 0) & (xn < Whr) & (yn >= 0) & (yn < Hhr)
@@ -110,7 +194,7 @@ def inverse_surface_image_to_hr(
         np.add.at(wgt, (yn[m], xn[m]), 1.0)
         out = (out > 0).astype(np.float32)
     else:
-        # Bilinear splat for image backprojection.
+        # Images: bilinear splat, then normalise by the accumulated weight.
         x0 = np.floor(xh).astype(np.int32)
         y0 = np.floor(yh).astype(np.int32)
         x1 = x0 + 1
@@ -136,6 +220,7 @@ def inverse_surface_image_to_hr(
                 from scipy.ndimage import distance_transform_edt
                 fillable = (~nz) & target_valid
                 if np.any(fillable):
+                    # EDT of ~nz returns, for every pixel, the index of the nearest supported pixel.
                     _, (ri, rj) = distance_transform_edt(~nz, return_indices=True)
                     out[fillable] = out[ri[fillable], rj[fillable]]
             except Exception:
@@ -158,11 +243,11 @@ def inverse_surface_image_to_hr(
 
 
 # ============================================================
-# MRI on Histology Space  (lifted from pipeline notebook)
+# MRI on histology space
 # ============================================================
 
 def _hr_2d(Ih_hr):
-    """HR histology as a plain 2D float array, accepting sitk or numpy, [1,H,W] or [H,W]."""
+    """Return HR histology as a 2D array; accepts sitk or numpy, [1, H, W] or [H, W]."""
     a = sitk.GetArrayFromImage(Ih_hr) if isinstance(Ih_hr, sitk.Image) else np.asarray(Ih_hr)
     if a.ndim == 3 and a.shape[0] == 1:
         a = a[0]
@@ -172,12 +257,10 @@ def _hr_2d(Ih_hr):
 
 
 def _scale_from_affine(A):
-    """x/y scale of a diagonal-plus-translation index affine, with a sanity check.
+    """Return the (x, y) scales of a diagonal-plus-translation affine, each clamped to >= 1.
 
-    The chain A_scaled_to_common @ A_proc_to_scaled @ A_hr_to_proc is built from
-    diagonal + translation matrices only, so A[0,0] and A[1,1] ARE the scales.
-    If a rotation ever enters the chain this assumption breaks silently, hence
-    the warning.
+    A[0, 0] and A[1, 1] are the scales only while the affine has no rotation;
+    a warning is printed if off-diagonal terms appear.
     """
     A = np.asarray(A, dtype=np.float64)
     off = abs(A[0, 1]) + abs(A[1, 0])
@@ -190,7 +273,21 @@ def _scale_from_affine(A):
 def build_hr_common_affines(proc_Ih, scaled_proc_Ih, A_hr_to_proc, oy_h, ox_h):
     """Compose the HR-histology <-> common-canvas index affines.
 
-    Returns (A_hr_to_common, A_common_to_hr), both 4x4 float64.
+    A_hr_to_common = A_scaled_to_common @ A_proc_to_scaled @ A_hr_to_proc,
+    and A_common_to_hr is its inverse. All factors are diagonal plus
+    translation, so the result is too.
+
+    Args:
+        proc_Ih: prepared (padded) histology at MRI spacing, sitk.Image.
+        scaled_proc_Ih: proc_Ih after rescaling by the best scale, sitk.Image.
+        A_hr_to_proc: 4x4 affine from HR pixel indices to proc pixel indices
+            (A_lr_to_proc @ A_hr_to_lr from preprocessing).
+        oy_h: row offset of the scaled histology on the common canvas.
+        ox_h: column offset of the scaled histology on the common canvas.
+
+    Returns:
+        Tuple (A_hr_to_common, A_common_to_hr) of 4x4 float64 arrays acting on
+        homogeneous (x, y, z, 1) pixel indices.
     """
     A_proc_to_scaled = make_A_proc_to_scaled(proc_Ih, scaled_proc_Ih)
     A_scaled_to_common = make_A_scaled_to_common(oy_h, ox_h)
@@ -210,15 +307,37 @@ def build_target_valid_mask(
     sigma_scale=0.35,
     verbose=True,
 ):
-    """Where in HR histology space can the surface actually deliver a sample?
+    """Build the mask of HR histology pixels the surface can deliver a sample to.
 
-    The surface is coarse (common-canvas resolution) and HR histology is ~100x
-    finer, so splatting the surface's support into HR leaves a sparse stipple.
-    We densify it: blur the splat footprint, threshold, close the gaps, fill
-    holes, and finally intersect with the real tissue mask so nothing outside
-    the section is ever claimed.
+    The surface is at common-canvas resolution and HR histology is much finer,
+    so splatting the surface support (an all-ones image over valid_display)
+    into HR leaves a sparse stipple. Within the tissue bounding box (padded by
+    two smoothing sigmas) the stipple is densified: Gaussian blur with
+    sigma = max(2, sigma_scale * s) HR pixels per axis, where s is the HR
+    pixels per common-canvas pixel taken from A_common_to_hr; threshold at
+    occ_thresh times the blurred maximum; separable rectangular closing; hole
+    filling. The result is intersected with the tissue mask so that nothing
+    outside the section is claimed.
 
-    Returns (target_valid_mask [Hhr,Whr] bool, support_w_hr [Hhr,Whr] float32).
+    Args:
+        mri_on_final_sheet: [Hs, Ws] MRI sampled on the final surface; only
+            its shape is used.
+        xy_map_sym: [Hs, Ws, 2] common-canvas (x, y) of each surface pixel.
+        A_common_to_hr: 4x4 common-canvas -> HR index affine (diagonal plus
+            translation).
+        Ih_hr: HR histology image (sitk.Image or array); defines the HR grid.
+        Mh_hr: HR histology tissue mask (sitk.Image or array).
+        valid_display: [Hs, Ws] bool; surface pixels that carry valid data.
+        occ_thresh: threshold on the blurred support, as a fraction of its
+            maximum.
+        sigma_scale: smoothing sigma and closing half-width, as a fraction of
+            the HR-per-common-pixel scale.
+        verbose: print the scale, ROI and coverage.
+
+    Returns:
+        Tuple (target_valid_mask, support_w_hr): [Hhr, Whr] bool mask and
+        [Hhr, Whr] float32 splat weight of the surface support. If the tissue
+        mask is empty, the mask is all False.
     """
     support_img = np.ones_like(np.asarray(mri_on_final_sheet), dtype=np.float32)
 
@@ -306,18 +425,40 @@ def resample_mri_to_hr(
     tile_hw=512,
     verbose=True,
 ):
-    """Dense HR pull-back:  HR pixel -> common -> surface index -> xyz -> MRI.
+    """Resample the MRI onto every HR histology pixel by pulling back through the surface.
 
-    xy_map_sym sends surface index -> common-canvas xy.  We need the inverse, so
-    we scatter-interpolate (surface row, surface col) as two scalar fields over
-    the common-space point cloud, then query it at every HR pixel mapped back
-    into common space.  Linear inside the convex hull; nearest as a fallback,
-    but ONLY where target_valid_mask already says the pixel is legitimate, so
-    the nearest-neighbour extrapolation can never invent tissue.
+    Chain: HR pixel -> common canvas -> surface index -> xyz_norm_final -> MRI.
+    xy_map_sym maps surface index -> common-canvas xy; the inverse is obtained
+    by scattered interpolation of (surface row, surface col) as two scalar
+    fields over the common-canvas positions of the valid surface pixels.
+    Interpolation is linear inside their convex hull; nearest-neighbour is used
+    as a fallback only where target_valid_mask marks the pixel as valid, so the
+    extrapolation cannot invent tissue. xyz_norm_final is then sampled
+    bilinearly at the (row, col), scaled to MRI voxel indices and the MRI is
+    sampled with a Catmull-Rom cubic kernel (border padding). Work is done
+    tile by tile over the bounding box of target_valid_mask.
 
-    Returns (mri_on_hr [Hhr,Whr] float32,
-             surface_valid_hr [Hhr,Whr] bool,
-             final_valid_hr [Hhr,Whr] bool).
+    Args:
+        slab_Im: MRI slab, sitk.Image or array [Z, Y, X].
+        xyz_norm_final: [Hs, Ws, 3] refined surface positions, normalised
+            (x, y, z) in [0, 1]; tensor or array.
+        xy_map_sym: [Hs, Ws, 2] common-canvas (x, y) of each surface pixel.
+        valid_display: [Hs, Ws] bool; surface pixels used to build the inverse
+            map.
+        target_valid_mask: [Hhr, Whr] bool from build_target_valid_mask().
+        A_common_to_hr: 4x4 common-canvas -> HR index affine.
+        Ih_hr: HR histology image; defines the HR grid.
+        device: torch device for the cubic MRI sampling.
+        tile_hw: tile edge length in HR pixels.
+        verbose: print sizes and coverage.
+
+    Returns:
+        Tuple (mri_on_hr, surface_valid_hr, final_valid_hr):
+            mri_on_hr: [Hhr, Whr] float32 MRI intensities, 0 outside
+                final_valid_hr.
+            surface_valid_hr: [Hhr, Whr] bool, pixels that received a surface
+                position.
+            final_valid_hr: [Hhr, Whr] bool, surface_valid_hr & target_valid_mask.
     """
     _xyz = xyz_norm_final.detach().cpu().numpy() if torch.is_tensor(xyz_norm_final) else np.asarray(xyz_norm_final)
     _xy_map = xy_map_sym.detach().cpu().numpy() if torch.is_tensor(xy_map_sym) else np.asarray(xy_map_sym)
@@ -461,18 +602,48 @@ def mri_on_histology_space(
     save_file_single=None,
     verbose=True,
 ):
-    """Entry point: take the refined sheet all the way to HR histology space.
+    """Resample the MRI on the refined surface into HR histology space.
 
-    Mirrors refine_curved_sheet() in ddf_estimation_v12 -- one call, prints its
-    own progress, returns the arrays the notebook needs.
+    Entry point of this module. Runs build_hr_common_affines(),
+    build_target_valid_mask() and resample_mri_to_hr() in order, prints its
+    own progress, and optionally draws the QC overlay with
+    qc.plot_mri_on_histology().
 
-    Returns
-    -------
-    mri_on_hr        : [Hhr,Whr] float32, MRI resampled onto HR histology pixels
-    final_valid_hr   : [Hhr,Whr] bool
-    A_hr_to_common   : 4x4
-    A_common_to_hr   : 4x4
-    info             : dict(target_valid_mask, surface_valid_hr, support_w_hr, Hhr, Whr)
+    Args:
+        Ih_hr: HR histology image, sitk.Image [1, Hhr, Whr] or array.
+        Mh_hr: HR histology tissue mask, same grid as Ih_hr.
+        proc_Ih: prepared (padded) histology at MRI spacing, sitk.Image.
+        scaled_proc_Ih: proc_Ih rescaled by the best scale, sitk.Image.
+        A_hr_to_proc: 4x4 HR -> proc index affine.
+        oy_h: row offset of the scaled histology on the common canvas.
+        ox_h: column offset of the scaled histology on the common canvas.
+        slab_Im: MRI slab, sitk.Image or array [Z, Y, X].
+        xyz_norm_final: [Hs, Ws, 3] refined surface positions, normalised
+            (x, y, z) in [0, 1].
+        xy_map_sym: [Hs, Ws, 2] common-canvas (x, y) of each surface pixel.
+        valid_display: [Hs, Ws] bool; valid surface pixels.
+        mri_on_final_sheet: [Hs, Ws] MRI sampled on the final surface; only its
+            shape is used.
+        device: torch device for MRI sampling.
+        tile_hw: tile edge length for the HR resampling, pixels.
+        occ_thresh: support threshold for build_target_valid_mask().
+        sigma_scale: smoothing scale for build_target_valid_mask().
+        show_proc_img: if True, draw the QC overlay.
+        tile_size: checkerboard tile size for the QC overlay, HR pixels.
+        save_file: optional output path for the multi-panel QC figure.
+        save_file_single: optional output path for a single image of the MRI
+            in histology space.
+        verbose: print progress from the sub-steps.
+
+    Returns:
+        Tuple (mri_on_hr, final_valid_hr, A_hr_to_common, A_common_to_hr, info):
+            mri_on_hr: [Hhr, Whr] float32 MRI resampled onto HR histology
+                pixels, 0 outside final_valid_hr.
+            final_valid_hr: [Hhr, Whr] bool validity mask.
+            A_hr_to_common: 4x4 HR -> common-canvas index affine.
+            A_common_to_hr: 4x4 common-canvas -> HR index affine.
+            info: dict with target_valid_mask, surface_valid_hr, support_w_hr,
+                Hhr and Whr.
     """
     print("\n-------- MRI on Histology Space --------")
 
