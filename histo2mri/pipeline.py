@@ -18,6 +18,27 @@ from .refine import refine_curved_sheet
 from .tps import ResidualToGSurface3D, fit_residual_tps2d, fit_residual_tps3d, fit_tps_robust, resample_histology_on_surface
 
 
+# Named settings for stains/regions that need different parameters. "default" is used for
+# everything unless a section asks for another profile (--profile, or a "profile" column in
+# the sections CSV).
+#   he-cblock: H&E sections of the cerebellum blocks. The internal granular layer is the
+#     darkest structure there and the molecular layer the brightest, so their contrast does
+#     not follow MRI intensity order: the refinement uses MIND (structure) instead of SSIM
+#     (intensity), and the stricter kNN outlier filter suits the sparse matches.
+PROFILES = {
+    "default": dict(
+        outlier_plane_dist=20.0,
+        outlier_knn=dict(k=8, plane_mad_k=3.0, tukey_k=3.0, cc_radius_scale=3.0),
+        refine_similarity_weights=(1.0, 0.0, 0.0),   # (w_ssim, w_ngf, w_mind)
+    ),
+    "he-cblock": dict(
+        outlier_plane_dist=20.0,
+        outlier_knn=dict(k=3, plane_mad_k=2.0, tukey_k=1.5, cc_radius_scale=2.0),
+        refine_similarity_weights=(0.0, 0.0, 1.0),
+    ),
+}
+
+
 def _to_np(x):
     return x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
 
@@ -33,10 +54,15 @@ def _reset_logging(log_path):
 
 
 def register_section(subject_id, num_str, histo_type, spacing, orientation, flip,
-                         args, device, common_kwargs, log_dir):
+                         args, device, common_kwargs, log_dir, profile="default"):
+    if profile not in PROFILES:
+        raise ValueError(f"Unknown profile {profile!r}; expected one of {list(PROFILES)}")
+    settings = PROFILES[profile]
+
     log_path = os.path.join(log_dir, f"{subject_id}_{num_str}_process.log")
     _reset_logging(log_path)
     logging.info("Process started")
+    logging.info(f"Profile: {profile} {settings}")
     section_start = time.perf_counter()
 
     # ---- Load ----
@@ -105,6 +131,7 @@ def register_section(subject_id, num_str, histo_type, spacing, orientation, flip
     )
     clean_matches, coarse_matches, pts_clean, sc_clean = filter_outliers(
         all_matches=all_matches["matches"], z_min=z_min, z_max=z_max,
+        plane_dist_thresh=settings["outlier_plane_dist"], knn_params=settings["outlier_knn"],
     )
     logging.info(f"Fine matching - clean_matches:{len(clean_matches)}")
 
@@ -236,6 +263,7 @@ def register_section(subject_id, num_str, histo_type, spacing, orientation, flip
         hist_on_init_tps=hist_on_init_tps, hist_mask_on_init_tps=None,
         ctrl_uv_support=uv_in2, tps_sigma_uv=20.0, tps_min_conf=0.25, tps_max_disp_vox=clamp_vox,
         lam_area=args.lam_area, lam_shape=args.lam_shape, w_rigid_mode=args.w_rigid_mode,
+        similarity_weights=settings["refine_similarity_weights"],
         gif_file=None,
     )
     logging.info("Refined curved sheet")
@@ -285,6 +313,7 @@ def register_section(subject_id, num_str, histo_type, spacing, orientation, flip
         mri_size=np.asarray(slab_Im.GetSize(), dtype=np.int64),
         subject_id=np.array(subject_id),
         num_str=np.array(num_str),
+        profile=np.array(profile),
         version=np.array([2], dtype=np.int32),
     )
     logging.info(f"Saved transform grid -> {save_path}")
@@ -300,6 +329,7 @@ def register_section(subject_id, num_str, histo_type, spacing, orientation, flip
         "output_npz": save_path,
         "n_clean_matches": len(clean_matches_common),
         "best_scale": best_scale,
+        "profile": profile,
         "elapsed_sec": elapsed_sec,
     }
 

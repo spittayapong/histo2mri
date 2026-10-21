@@ -9,19 +9,22 @@ import shutil
 import time
 import traceback
 from datetime import datetime
-import matplotlib
 import pandas as pd
 import torch
 from .io import build_num_str, parse_flip, parse_orientation, parse_spacing
-from .pipeline import register_section
+from .pipeline import PROFILES, register_section
 
 
 def build_arg_parser():
     p = argparse.ArgumentParser(description="Batch-run the full registration pipeline over sections")
     p.add_argument("--sections-csv", required=True,
-                    help="Same format as annotations_run.py: internal: subject_id,slice_id,orientation,spacing. "
-                         "NB: subject_id,block_id,slice_id,orientation,stain,spacing. "
-                         "spacing is a quoted 'x,y,z' string. Optional 'flip' column: letters x/y/z.")
+                    help="One section per row. --ds-type internal: subject_id,slice_id,orientation,spacing. "
+                         "--ds-type NB: subject_id,block_id,slice_id,orientation,stain,spacing. "
+                         "spacing is a quoted 'x,y,z' string. Optional columns: 'flip' (letters x/y/z) "
+                         "and 'profile' (overrides --profile for that row).")
+    p.add_argument("--profile", default="default", choices=sorted(PROFILES),
+                    help="Named parameter set (see histo2mri.pipeline.PROFILES). Use he-cblock only for "
+                         "H&E cerebellum-block sections.")
     p.add_argument("--ds-type", default="internal", choices=["internal", "NB"])
     p.add_argument("--histo-type", required=True,
                     help="Suffix in data/<subject_id>/histo_<histo_type>/, e.g. myelin/iron/he.")
@@ -106,6 +109,8 @@ def main():
             spacing = parse_spacing(row["spacing"])
             orientation = parse_orientation(row["orientation"])
             flip = parse_flip(row.get("flip", ""))
+            profile = (row.get("profile") or "").strip() or args.profile
+            entry["profile"] = profile
 
             log_dir = os.path.join(args.save_dir, subject_id, histo_type, num_str)
             if os.path.exists(log_dir):
@@ -115,11 +120,11 @@ def main():
             with suppress_output(enabled=not args.verbose):
                 info = register_section(
                     subject_id, num_str, histo_type, spacing, orientation, flip,
-                    args, device, common_kwargs, log_dir,
+                    args, device, common_kwargs, log_dir, profile=profile,
                 )
             entry.update(status="ok", **info)
             print(f"[{i}/{total}] {subject_id} {histo_type} {num_str} ... DONE "
-                  f"(n_matches={info['n_clean_matches']}, best_scale={info['best_scale']:.3f}, "
+                  f"(profile={profile}, n_matches={info['n_clean_matches']}, best_scale={info['best_scale']:.3f}, "
                   f"elapsed={info['elapsed_sec']:.1f}s)", flush=True)
         except Exception as e:
             entry.update(status="error", error=f"{type(e).__name__}: {e}",

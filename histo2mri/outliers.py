@@ -253,14 +253,18 @@ def filter_outliers(
     all_matches,
     z_min=None,
     z_max=None,
+    plane_dist_thresh=20.0,
+    knn_params=None,
 ):
+    if knn_params is None:
+        knn_params = dict(k=8, plane_mad_k=3.0, tukey_k=3.0, cc_radius_scale=3.0)
+
     # Coarse pre-filter outliers.
     coarse_idx = ransac_plane_fit_z_from_matches_robust(
         all_matches,
         z_min=z_min,
         z_max=z_max,
-        # dist_thresh=5.0,      # For H&E NB_C-Block
-        dist_thresh=20.0,       # For others
+        dist_thresh=plane_dist_thresh,
         knn_k=3,
         knn_mad_k=3.5,
     )
@@ -281,10 +285,7 @@ def filter_outliers(
     idx_in = idx_valid[inlier_mask]
 
     # Stricter outlier cleanup
-    clean_idx, _, _ = knn_outlier_mask_plane_xy_iqr(
-        pts_in, k=8, plane_mad_k=3.0, tukey_k=3.0, cc_radius_scale=3.0        # For others
-        # pts_in, k=3, plane_mad_k=2.0, tukey_k=1.5, cc_radius_scale=2.0          # For H&E NB_C-Block
-    )
+    clean_idx, _, _ = knn_outlier_mask_plane_xy_iqr(pts_in, **knn_params)
     pts_clean = pts_in[clean_idx]
     sc_clean  = sc_in[clean_idx]
     idx_clean = idx_in[clean_idx]

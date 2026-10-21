@@ -211,6 +211,7 @@ def pyramid_refinement(
     lam_shape=0.0,          # orthonormality: weight on ||[[E,F],[F,G]] - base||^2 (OFF by default)
     w_rigid_mode="mask",    # "mask" | "conf" | "edge" | "none"
     rigid_edge_k=2.0,       # only used by w_rigid_mode="edge"
+    similarity_weights=(1.0, 0.0, 0.0),   # (w_ssim, w_ngf, w_mind) of the image loss
 ):
     """
     v11 refinement: four fields, alternated per pyramid level.
@@ -249,8 +250,7 @@ def pyramid_refinement(
       could.
     """
     similarity_metric = "mind"   # "ngf" or "mind" -- switch here to test MIND instead of NGF
-    w_ssim, w_ngf, w_mind = 1.0, 0.0, 0.0     # For Others
-    # w_ssim, w_ngf, w_mind = 0.0, 0.0, 1.0       # For H&E C-Block coz IGL is the darkest and molecule is the brightest, brighter than WM, so that intensity comparison doesn't work then MIND is used instead.
+    w_ssim, w_ngf, w_mind = similarity_weights
     hist_mask_fixed = (hist_mask_t > 0.5).float().detach()
     mask_soft = make_soft_dilated_mask(hist_mask_fixed, dilate_px=8, blur_ks=11, blur_passes=1).detach()
 
@@ -577,6 +577,7 @@ def refine_curved_sheet(
     w_rigid_mode="mask",
     rigid_edge_k=2.0,
     lam_rigid_levels=(1.0, 1.0, 1.0),   # per-pyramid-level multiplier on the rigidity loss
+    similarity_weights=(1.0, 0.0, 0.0),  # (w_ssim, w_ngf, w_mind), passed to pyramid_refinement
 ):
     print("\n-------- Refine Curved Sheet (v12: + local rigidity) --------")
 
@@ -773,6 +774,7 @@ def refine_curved_sheet(
             lam_shape=lam_shape,
             w_rigid_mode=w_rigid_mode,
             rigid_edge_k=rigid_edge_k,
+            similarity_weights=similarity_weights,
         )
 
         with torch.no_grad():
