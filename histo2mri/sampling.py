@@ -170,11 +170,11 @@ def make_monotone_lut(
 
     # Subsample if too large
     if svals.size > max_samples:
-        idx = np.random.choice(svals.size, max_samples, replace=False)
+        idx = np.random.default_rng(0).choice(svals.size, max_samples, replace=False)
         svals = svals[idx]
 
     if rvals.size > max_samples:
-        idx = np.random.choice(rvals.size, max_samples, replace=False)
+        idx = np.random.default_rng(1).choice(rvals.size, max_samples, replace=False)
         rvals = rvals[idx]
 
     # Quantiles

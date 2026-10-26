@@ -8,12 +8,25 @@ shown with matplotlib and saved only when a path is given.
 """
 import numpy as np
 import SimpleITK as sitk
+import matplotlib
 import matplotlib.pyplot as plt
 import os
 import torch
 import math
+from matplotlib.path import Path
+from scipy.spatial import ConvexHull
+from .canvas import _to_zyx_volume, fit_plane_z_ax_by_c
 from .outliers import _extract_match_points
 from .sampling import apply_lut_monotone, make_monotone_lut, robust01
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _show():
+    """Show the current figures when the Matplotlib backend can display them (not under Agg)."""
+    if matplotlib.get_backend().lower() != "agg":
+        plt.show()
 
 
 def show_proc_image(img, mask, title, idx=0, save_file=None):
@@ -46,10 +59,11 @@ def show_proc_image(img, mask, title, idx=0, save_file=None):
     axes[1].set_title(f"Processed {title} Mask")
 
     plt.tight_layout()
-    plt.show()
+    _show()
+    plt.close(fig)
 
     if save_file is not None:
-        os.makedirs(os.path.dirname(save_file), exist_ok=True)
+        os.makedirs(os.path.dirname(save_file) or '.', exist_ok=True)
 
         fig2, ax2 = plt.subplots(figsize=(6, 6))
         ax2.imshow(np.flipud(arr_img), cmap='gray')
@@ -60,7 +74,7 @@ def show_proc_image(img, mask, title, idx=0, save_file=None):
         fig2.savefig(save_file, dpi=300, bbox_inches="tight")
         plt.close(fig2)
 
-        print(f"Saved histology image to: {save_file}")
+        logger.debug(f'Saved histology image to: {save_file}')
 
 
 def show_matched_pairs(
@@ -101,7 +115,7 @@ def show_matched_pairs(
     """
     vals = [m for m in matches if m["mri_center_zyx"][0] >= 0]
     if len(vals) == 0:
-        print("No valid matches.")
+        logger.warning('No valid matches.')
         return
 
     if sort_by_score:
@@ -168,51 +182,12 @@ def show_matched_pairs(
     plt.tight_layout()
 
     if save_file is not None:
-        os.makedirs(os.path.dirname(save_file), exist_ok=True) if os.path.dirname(save_file) else None
+        os.makedirs(os.path.dirname(save_file) or '.', exist_ok=True)
         fig.savefig(save_file, dpi=200, bbox_inches="tight")
-        print(f"Saved figure to: {save_file}")
+        logger.debug(f'Saved figure to: {save_file}')
 
-    plt.show()
-
-
-def fit_plane_z_ax_by_c(pts_zyx, weights=None):
-    """Fit the plane z = a*x + b*y + c to points by (weighted) least squares.
-
-    Args:
-        pts_zyx: Array [N, 3] of points as (z, y, x), e.g. MRI voxel indices.
-        weights: Optional non-negative weights [N]; the residuals are weighted
-            by sqrt(weight), with weights clipped below at 1e-8.
-
-    Returns:
-        Tuple (a, b, c) of floats.
-    """
-    z = pts_zyx[:, 0].astype(np.float64)
-    y = pts_zyx[:, 1].astype(np.float64)
-    x = pts_zyx[:, 2].astype(np.float64)
-    A = np.stack([x, y, np.ones_like(x)], axis=1)
-
-    if weights is not None:
-        w = np.sqrt(np.clip(weights, 1e-8, None))
-        Aw = A * w[:, None]
-        zw = z * w
-        a, b, c = np.linalg.lstsq(Aw, zw, rcond=None)[0]
-    else:
-        a, b, c = np.linalg.lstsq(A, z, rcond=None)[0]
-
-    return float(a), float(b), float(c)
-
-
-def _to_zyx_volume(vol):
-    """Return a SimpleITK image or array as a float32 array [Z, Y, X] (2D input gets Z=1)."""
-    if sitk is not None and isinstance(vol, sitk.Image):
-        arr = sitk.GetArrayFromImage(vol)  # [Z,Y,X]
-    else:
-        arr = np.asarray(vol)
-    if arr.ndim == 2:
-        arr = arr[None, ...]
-    if arr.ndim != 3:
-        raise ValueError(f"Expected 3D volume [Z,Y,X], got shape={arr.shape}")
-    return arr.astype(np.float32)
+    _show()
+    plt.close(fig)
 
 
 def _make_xz_canvas(vol_zyx, z_min, z_max, mode="mip"):
@@ -311,11 +286,11 @@ def visualize_roi_from_matches(
 
     pts, sc = _extract_match_points(matches, score_key=score_key, z_min=z_min, z_max=z_max)
     if len(pts) < 3:
-        print("Not enough valid points for visualization.")
+        logger.warning('Not enough valid points for visualization.')
         return None
 
     if len(pts) > max_points:
-        idx = np.random.choice(len(pts), max_points, replace=False)
+        idx = np.random.default_rng(0).choice(len(pts), max_points, replace=False)
         pts, sc = pts[idx], sc[idx]
 
     # Score-weighted plane fit (weights = scores min-max normalized to [0, 1]).
@@ -346,7 +321,7 @@ def visualize_roi_from_matches(
 
     # (1) 3D
     ax0 = fig.add_subplot(gs[0, 0], projection="3d")
-    p0 = ax0.scatter(x, y, z, c=sc, s=8, cmap="turbo", alpha=0.9)
+    ax0.scatter(x, y, z, c=sc, s=8, cmap="turbo", alpha=0.9)
     ax0.plot_surface(XX, YY, ZZ, alpha=0.28, color="cyan", linewidth=0, antialiased=False)
     ax0.set_xlim(0, X - 1); ax0.set_ylim(0, Y - 1); ax0.set_zlim(0, Z - 1)
     ax0.set_xlabel("X"); ax0.set_ylabel("Y"); ax0.set_zlabel("Z")
@@ -356,7 +331,7 @@ def visualize_roi_from_matches(
     # (2) XZ
     ax1 = fig.add_subplot(gs[0, 1])
     ax1.imshow(canvas_xz, cmap="gray", origin="lower", extent=[0, X - 1, 0, Z - 1], aspect="auto")
-    p1 = ax1.scatter(x, z, c=sc, s=10, cmap="turbo", alpha=0.9)
+    ax1.scatter(x, z, c=sc, s=10, cmap="turbo", alpha=0.9)
     ax1.set_xlim(0, X - 1); ax1.set_ylim(0, Z - 1)
     ax1.set_xlabel("X"); ax1.set_ylabel("Z")
     ax1.set_title(f"XZ overlay ({mode})")
@@ -378,12 +353,92 @@ def visualize_roi_from_matches(
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
         fig.savefig(save_file, dpi=200, bbox_inches="tight")
-        print(f"Saved figure to: {save_file}")
+        logger.debug(f'Saved figure to: {save_file}')
 
-    print(f"Fitted plane: z = {a:.5f}*x + {b:.5f}*y + {c:.5f}")
-    plt.show()
+    logger.debug(f'Fitted plane: z = {a:.5f}*x + {b:.5f}*y + {c:.5f}')
+    _show()
+    plt.close(fig)
 
     return {"a": float(a), "b": float(b), "c": float(c), "n_points": int(len(pts))}
+
+
+def plot_roi_support(clean_matches, scaled_proc_Ih, plane_img, x0, y0, step=1.0, save_file=None):
+    """Plot the convex-hull support of the clean matches on the histology and on the ROI plane.
+
+    Left panel: scaled histology with the match centers (``hist_center_yx``) and their
+    convex hull, titled with the fraction of image pixels inside it. Right panel: the
+    MRI plane image from canvas.extract_roi_plane with the MRI match centers converted to
+    plane-image pixels, their hull, and the hull coverage over all pixels and over
+    non-NaN pixels. The coverages are logged at debug level.
+
+    Args:
+        clean_matches: Outlier-filtered match dicts (``hist_center_yx``, ``mri_center_zyx``).
+        scaled_proc_Ih: Scaled, prepared histology (SimpleITK image or array; a 3D array
+            uses slice 0).
+        plane_img: MRI plane image [H, W] from canvas.extract_roi_plane.
+        x0: MRI x voxel index of plane-image column 0.
+        y0: MRI y voxel index of plane-image row 0.
+        step: Plane grid spacing in voxels.
+        save_file: Optional path for the figure (PNG, 200 dpi).
+
+    Raises:
+        ValueError: If fewer than 3 points are available for either hull.
+    """
+    h = sitk.GetArrayFromImage(scaled_proc_Ih) if hasattr(scaled_proc_Ih, "GetSize") else np.asarray(scaled_proc_Ih)
+    if h.ndim == 3:
+        h = h[0]
+
+    # Histology support
+    pts_hist = np.array([[m["hist_center_yx"][1], m["hist_center_yx"][0]] for m in clean_matches], dtype=np.float32)  # (x,y)
+    if len(pts_hist) < 3:
+        raise ValueError("Need >=3 clean_matches for histology hull.")
+    poly_h = pts_hist[ConvexHull(pts_hist).vertices]
+    H, W = h.shape
+    yy, xx = np.mgrid[0:H, 0:W]
+    hist_cov = float(Path(poly_h).contains_points(np.c_[xx.ravel(), yy.ravel()]).mean())
+
+    # Plane support: MRI (x, y) voxel positions converted to plane-image pixels.
+    pts_xy = np.array(
+        [[m["mri_center_zyx"][2], m["mri_center_zyx"][1]] for m in clean_matches if m["mri_center_zyx"][0] >= 0],
+        dtype=np.float32,
+    )
+    Hp, Wp = plane_img.shape
+    px = (pts_xy[:, 0] - float(x0)) / step
+    py = (pts_xy[:, 1] - float(y0)) / step
+    in_img = (px >= 0) & (px < Wp) & (py >= 0) & (py < Hp)
+    pts_px_in = np.stack([px, py], axis=1)[in_img]
+    if len(pts_px_in) < 3:
+        raise ValueError("Need >=3 MRI points inside the plane image for the plane hull.")
+    poly_p = pts_px_in[ConvexHull(pts_px_in).vertices]
+    yyg, xxg = np.mgrid[0:Hp, 0:Wp]
+    inside_p = Path(poly_p).contains_points(np.c_[xxg.ravel(), yyg.ravel()]).reshape(Hp, Wp)
+    plane_cov_all = float(inside_p.mean())
+    finite = np.isfinite(plane_img)
+    plane_cov_valid = float((inside_p & finite).sum() / max(finite.sum(), 1))
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    axes[0].imshow(h, cmap="gray", origin="lower")
+    axes[0].scatter(pts_hist[:, 0], pts_hist[:, 1], s=8, c="lime")
+    axes[0].plot(np.r_[poly_h[:, 0], poly_h[0, 0]], np.r_[poly_h[:, 1], poly_h[0, 1]], c="cyan", lw=1.2)
+    axes[0].set_title(f"Histology support (hull cov={hist_cov:.3f})")
+    axes[0].axis("off")
+    axes[1].imshow(np.nan_to_num(plane_img, nan=0.0), cmap="gray", origin="lower")
+    axes[1].scatter(pts_px_in[:, 0], pts_px_in[:, 1], s=8, c="lime")
+    axes[1].plot(np.r_[poly_p[:, 0], poly_p[0, 0]], np.r_[poly_p[:, 1], poly_p[0, 1]], c="cyan", lw=1.2)
+    axes[1].set_title(f"Plane support (all={plane_cov_all:.3f}, valid={plane_cov_valid:.3f})")
+    axes[1].axis("off")
+    plt.tight_layout()
+
+    if save_file is not None:
+        save_dir = os.path.dirname(save_file)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        fig.savefig(save_file, dpi=200, bbox_inches="tight")
+        logger.debug(f"Saved figure to: {save_file}")
+    _show()
+    plt.close(fig)
+
+    logger.debug(f"hull coverage: hist={hist_cov:.6f} plane_all={plane_cov_all:.6f} plane_valid={plane_cov_valid:.6f}")
 
 
 def plot_mri_on_sheet(
@@ -493,9 +548,9 @@ def plot_mri_on_sheet(
         if d:
             os.makedirs(d, exist_ok=True)
         fig.savefig(save_file, dpi=300, bbox_inches="tight")
-        print(f"Saved: {save_file}")
+        logger.debug(f'Saved: {save_file}')
 
-    plt.show()
+    _show()
     plt.close(fig)
 
     if save_file_single is not None:
@@ -508,7 +563,7 @@ def plot_mri_on_sheet(
         fig3.tight_layout(pad=0)
         fig3.savefig(save_file_single, dpi=300, bbox_inches="tight", pad_inches=0)
         plt.close(fig3)
-        print(f"Saved mri_on_final_sheet to: {save_file_single}")
+        logger.debug(f'Saved mri_on_final_sheet to: {save_file_single}')
 
     return h_disp, v.astype(np.float32), r_disp, v
 
@@ -635,14 +690,15 @@ def plot_mri_on_histology(mri_on_histo, Ih_hr, Mh_hr, tile_size=384, save_file=N
     plt.tight_layout()
 
     if save_file is not None:
-        os.makedirs(os.path.dirname(save_file), exist_ok=True)
+        os.makedirs(os.path.dirname(save_file) or '.', exist_ok=True)
         fig.savefig(save_file, dpi=300, bbox_inches="tight")
-        print(f"Saved figure to: {save_file}")
+        logger.debug(f'Saved figure to: {save_file}')
 
-    plt.show()
+    _show()
+    plt.close(fig)
 
     if save_file_single is not None:
-        os.makedirs(os.path.dirname(save_file_single), exist_ok=True)
+        os.makedirs(os.path.dirname(save_file_single) or '.', exist_ok=True)
         fig2, ax2 = plt.subplots(figsize=(6, 6))
         ax2.imshow(mri_disp, cmap='gray')
         ax2.set_title("MRI on histology space")
@@ -650,7 +706,7 @@ def plot_mri_on_histology(mri_on_histo, Ih_hr, Mh_hr, tile_size=384, save_file=N
         fig2.tight_layout()
         fig2.savefig(save_file_single, dpi=300, bbox_inches="tight")
         plt.close(fig2)
-        print(f"Saved image to: {save_file_single}")
+        logger.debug(f'Saved image to: {save_file_single}')
 
 
 def plot_mri_on_histology_rgb(
@@ -807,9 +863,9 @@ def plot_mri_on_histology_rgb(
         if d:
             os.makedirs(d, exist_ok=True)
         fig.savefig(save_file, dpi=300, bbox_inches="tight")
-        print(f"Saved: {save_file}")
+        logger.debug(f'Saved: {save_file}')
 
-    plt.show()
+    _show()
     plt.close(fig)
 
 
@@ -821,7 +877,7 @@ def _plot_surface(z_tensor, title, save_file=None):
     ax = fig.add_subplot(111, projection="3d")
 
     # Translucent red fill with a thin red wireframe to show the shape.
-    surf = ax.plot_surface(
+    ax.plot_surface(
         xs, ys, z,
         color=(0.95, 0.45, 0.45, 0.35),  # RGBA (soft red, 35% opaque)
         edgecolor=(0.82, 0.20, 0.20, 0.6),
@@ -834,9 +890,10 @@ def _plot_surface(z_tensor, title, save_file=None):
     plt.tight_layout()
 
     if save_file is not None:
-        os.makedirs(os.path.dirname(save_file), exist_ok=True)
+        os.makedirs(os.path.dirname(save_file) or '.', exist_ok=True)
         fig.savefig(save_file, dpi=300, bbox_inches="tight")
-        print(f"Saved figure to: {save_file}")
+        logger.debug(f'Saved figure to: {save_file}')
 
-    plt.show()
+    _show()
+    plt.close(fig)
 

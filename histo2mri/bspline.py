@@ -197,22 +197,6 @@ class BSplineFFD2D(nn.Module):
         return out.view(*orig_shape, 2)
 
 
-def bending_energy_2d(ctrl):
-    """Return the bending penalty of a 2D-vector control grid.
-
-    Same computation as ``bending_energy``; used for the ``BSplineFFD2D`` grids.
-
-    Args:
-        ctrl: (grid_h, grid_w, C) control grid, grid_h and grid_w >= 3.
-
-    Returns:
-        Scalar tensor: mean squared second differences along axis 0 plus along axis 1.
-    """
-    dx2 = ctrl[2:, 1:-1] - 2*ctrl[1:-1, 1:-1] + ctrl[:-2, 1:-1]
-    dy2 = ctrl[1:-1, 2:] - 2*ctrl[1:-1, 1:-1] + ctrl[1:-1, :-2]
-    return (dx2.pow(2).mean() + dy2.pow(2).mean())
-
-
 class ScalarNormalOffsetField(nn.Module):
     """Scalar B-spline field alpha(u, v) = sum_ij B_i(u) B_j(v) ctrl[j, i, 0].
 

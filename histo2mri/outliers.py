@@ -8,6 +8,9 @@ isolated, are discarded. Match points are handled as MRI voxel indices in
 """
 import numpy as np
 from scipy.spatial import cKDTree
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def ransac_plane_fit_z_from_matches_robust(
@@ -359,7 +362,9 @@ def filter_outliers(
         knn_k=3,
         knn_mad_k=3.5,
     )
-
+    if not coarse_idx.get("ok", False):
+        raise ValueError(f"Coarse outlier filter failed ({coarse_idx.get('reason')}): "
+                         f"too few usable matches ({len(all_matches)} candidates)")
 
     coarse_matches = [all_matches[i] for i in coarse_idx["inlier_idx"]]
 
@@ -381,7 +386,7 @@ def filter_outliers(
     pts_clean = pts_in[clean_idx]
     sc_clean  = sc_in[clean_idx]
     idx_clean = idx_in[clean_idx]
-    print("removed:", (~clean_idx).sum(), "kept:", clean_idx.sum())
+    logger.info('Outlier filter: removed %s, kept %s matches', (~clean_idx).sum(), clean_idx.sum())
 
     clean_matches = [all_matches[i] for i in idx_clean]
 

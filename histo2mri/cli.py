@@ -2,14 +2,18 @@
 
 Each row of the sections CSV describes one histology section; main() calls
 pipeline.register_section for it, writes that section's outputs to
-<save-dir>/<subject_id>/<histo-type>/<num_str>/, and finally writes a summary CSV with one
-row per section. Matplotlib is switched to the non-interactive Agg backend on import.
+<save-dir>/<subject_id>/<histo-type>/<num_str>/, and keeps a summary CSV with one row per
+section. Matplotlib is switched to the non-interactive Agg backend on import.
+
+Console output: one status line per section. Warnings from the pipeline are shown; with
+--verbose, all log messages (including per-iteration progress) and progress bars are shown.
+Each section's own log file always contains the INFO-level messages.
 """
 import matplotlib
 matplotlib.use("Agg")
 import argparse
-import contextlib
 import csv
+import logging
 import os
 import shutil
 import time
@@ -22,12 +26,7 @@ from .pipeline import PROFILES, register_section
 
 
 def build_arg_parser():
-    """Build the argument parser of the batch command-line tool.
-
-    Returns:
-        argparse.ArgumentParser. The parsed namespace is passed as `args` to
-        pipeline.register_section, which reads several of its fields directly.
-    """
+    """Build the argument parser of the batch command-line tool."""
     p = argparse.ArgumentParser(description="Batch-run the full registration pipeline over sections")
     p.add_argument("--sections-csv", required=True,
                     help="One section per row. --ds-type internal: subject_id,slice_id,orientation,spacing. "
@@ -37,17 +36,19 @@ def build_arg_parser():
     p.add_argument("--profile", default="default", choices=sorted(PROFILES),
                     help="Named parameter set (see histo2mri.pipeline.PROFILES). Use he-cblock only for "
                          "H&E cerebellum-block sections.")
-    p.add_argument("--ds-type", default="internal", choices=["internal", "NB"])
+    p.add_argument("--ds-type", default="internal", choices=["internal", "NB"],
+                    help="Section naming scheme of the CSV; NB (NextBrain) also uses a RANSAC sample "
+                         "size of 3 instead of 5.")
     p.add_argument("--histo-type", required=True,
-                    help="Suffix in data/<subject_id>/histo_<histo_type>/, e.g. myelin/iron/he.")
-    p.add_argument("--data-root", required=True)
-    p.add_argument("--save-dir", default="./evaluations/")
-    p.add_argument("--patch-size", type=int, default=64)
-    p.add_argument("--pclip", nargs=2, type=float, default=(1, 99), metavar=("LOW", "HIGH"))
-    p.add_argument("--n-slices-offset-divisor", type=int, default=2,
-                    help="n_slices = Im depth // this (only affects QC display slice index)")
-    p.add_argument("--scale-max", type=float, default=1.30, help="Upper bound (inclusive-ish) for best-scale search")
-    p.add_argument("--scale-step", type=float, default=0.05)
+                    help="Suffix in <data-root>/<subject_id>/histo_<histo_type>/, e.g. myelin/iron/he.")
+    p.add_argument("--data-root", required=True, help="Root folder of the data (layout: see README).")
+    p.add_argument("--save-dir", default="./results", help="Output root folder.")
+    p.add_argument("--patch-size", type=int, default=64,
+                    help="The histology is padded to a multiple of this (px).")
+    p.add_argument("--pclip", nargs=2, type=float, default=(1, 99), metavar=("LOW", "HIGH"),
+                    help="Percentiles for the MRI intensity normalisation.")
+    p.add_argument("--scale-max", type=float, default=1.30, help="Upper end of the histology scale search.")
+    p.add_argument("--scale-step", type=float, default=0.05, help="Step of the histology scale search.")
     p.add_argument("--device", default=None, help="cuda:0 / cpu; auto-detect if omitted")
     p.add_argument("--mri-on-histo-tile-size", type=int, default=348,
                     help="Checkerboard tile size (px) for the mri_on_histo overlay. "
@@ -58,29 +59,23 @@ def build_arg_parser():
                     help="Local rigidity: weight on first-fundamental-form drift (orthonormality).")
     p.add_argument("--w-rigid-mode", default="mask", choices=["mask", "conf", "edge", "none"],
                     help="Spatial rigidity weight map used by the refinement.")
+    p.add_argument("--save-roi-qc", action="store_true",
+                    help="Also save the three ROI QC figures per section.")
     p.add_argument("--limit", type=int, default=None, help="Only process the first N rows (dry-run)")
     p.add_argument("--log-csv", default=None, help="Summary log path; defaults to <save-dir>/run_log_<timestamp>.csv")
     p.add_argument("--verbose", action="store_true",
-                    help="Show print()/tqdm output from the underlying modules. Off by default.")
+                    help="Show all log messages and progress bars on the console.")
     return p
 
 
-@contextlib.contextmanager
-def suppress_output(enabled=True):
-    """Context manager that sends stdout and stderr to os.devnull while it is active.
-
-    Used to hide the print()/tqdm progress output of the pipeline modules; log files are
-    not affected.
-
-    Args:
-        enabled: If False, the context manager does nothing and output is shown.
-    """
-    if not enabled:
-        yield
-        return
-    with open(os.devnull, "w") as devnull:
-        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-            yield
+def _setup_console_logging(verbose):
+    """Show the package's warnings (or, with verbose, all its messages) on the console."""
+    pkg_logger = logging.getLogger("histo2mri")
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG if verbose else logging.WARNING)
+    handler.setFormatter(logging.Formatter("    %(levelname)s %(name)s: %(message)s"))
+    pkg_logger.addHandler(handler)
+    pkg_logger.setLevel(logging.DEBUG if verbose else logging.INFO)
 
 
 def main():
@@ -88,37 +83,21 @@ def main():
 
     For each row (up to --limit rows): build the section identifier num_str
     (io.build_num_str), parse spacing, orientation and the optional flip column, pick the
-    profile (the row's "profile" column, else --profile), delete and recreate the section's
-    output directory <save-dir>/<subject_id>/<histo-type>/<num_str>, and call
-    pipeline.register_section with module output suppressed unless --verbose. A failure in
-    one section is reported (message and traceback on the console) and the loop continues.
-    The device is --device, or cuda:0 when CUDA is available, else cpu.
+    profile (the row's "profile" column, else --profile), delete any previous output of the
+    section in <save-dir>/<subject_id>/<histo-type>/<num_str>, and call
+    pipeline.register_section. A failure in one section is reported (message and traceback on
+    the console) and the loop continues.
 
-    The summary CSV (--log-csv, default <save-dir>/run_log_<YYYYmmdd_HHMMSS>.csv) is written
-    once, after all rows. It has one row per section with the columns subject_id,
-    histo_type, num_str, status ("ok" or "error"), profile, and either the values returned
-    by register_section (output_npz, n_clean_matches, best_scale, elapsed_sec) or error (the
-    exception message) and elapsed_sec. Columns that do not apply to a row are empty.
+    The summary CSV (--log-csv, default <save-dir>/run_log_<YYYYmmdd_HHMMSS>.csv) is rewritten
+    after every section, so it survives an interrupted run. It has one row per section with
+    the columns subject_id, histo_type, num_str, status ("ok" or "error"), profile, and either
+    the values returned by register_section (output_npz, n_clean_matches, best_scale,
+    elapsed_sec) or error (the exception message) and elapsed_sec.
     """
     args = build_arg_parser().parse_args()
+    _setup_console_logging(args.verbose)
     device = torch.device(args.device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
-
-    # Patch-matcher settings shared by the scale search, the patch-configuration search and
-    # the fine matching: HOG cell size and orientation bins, minimum mask fractions per patch
-    # and minimum mask overlap, number of HOG candidates kept per histology patch, HOG/MIND
-    # fusion weights, MIND radius and dilation, and batch/chunk sizes.
-    common_kwargs = dict(
-        device=device,
-        cell_size=8, bins=18,
-        min_histo_mask_frac=0.2,
-        min_mri_mask_frac=0.50,
-        min_overlap_frac=0.35,
-        topk_hog=64, w_hog=0.6, w_mind=0.4,
-        mind_radius=2, mind_dilation=1,
-        hist_batch=128,
-        mri_chunk=16384,
-        keep_mri_bank_on_gpu=True,
-    )
+    ransac_sample_size = 3 if args.ds_type == "NB" else 5
 
     with open(args.sections_csv, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
@@ -140,6 +119,7 @@ def main():
             entry.update(status="error", error=f"Missing column {e} required for --ds-type {args.ds_type}")
             print(f"[{i}/{total}] {subject_id} ... FAILED ({entry['error']})", flush=True)
             results.append(entry)
+            pd.DataFrame(results).to_csv(log_csv, index=False)
             continue
 
         entry["num_str"] = num_str
@@ -152,16 +132,20 @@ def main():
             profile = (row.get("profile") or "").strip() or args.profile
             entry["profile"] = profile
 
-            log_dir = os.path.join(args.save_dir, subject_id, histo_type, num_str)
-            if os.path.exists(log_dir):
-                shutil.rmtree(log_dir)
-            os.makedirs(log_dir, exist_ok=True)
+            out_dir = os.path.join(args.save_dir, subject_id, histo_type, num_str)
+            if os.path.exists(out_dir):
+                shutil.rmtree(out_dir)
 
-            with suppress_output(enabled=not args.verbose):
-                info = register_section(
-                    subject_id, num_str, histo_type, spacing, orientation, flip,
-                    args, device, common_kwargs, log_dir, profile=profile,
-                )
+            info = register_section(
+                subject_id, num_str, histo_type, spacing, orientation, flip,
+                args.data_root, out_dir,
+                profile=profile, device=device, ransac_sample_size=ransac_sample_size,
+                patch_size=args.patch_size, pclip=tuple(args.pclip),
+                scale_max=args.scale_max, scale_step=args.scale_step,
+                lam_area=args.lam_area, lam_shape=args.lam_shape, w_rigid_mode=args.w_rigid_mode,
+                mri_on_histo_tile_size=args.mri_on_histo_tile_size,
+                save_roi_qc=args.save_roi_qc, verbose=args.verbose,
+            )
             entry.update(status="ok", **info)
             print(f"[{i}/{total}] {subject_id} {histo_type} {num_str} ... DONE "
                   f"(profile={profile}, n_matches={info['n_clean_matches']}, best_scale={info['best_scale']:.3f}, "
@@ -173,14 +157,14 @@ def main():
                   f"({type(e).__name__}: {e}, elapsed={entry['elapsed_sec']:.1f}s)", flush=True)
             traceback.print_exc()
         finally:
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         results.append(entry)
+        pd.DataFrame(results).to_csv(log_csv, index=False)
 
-    pd.DataFrame(results).to_csv(log_csv, index=False)
     print(f"\nDone. Summary log -> {log_csv}")
     n_ok = sum(r["status"] == "ok" for r in results)
     print(f"{n_ok}/{len(results)} sections succeeded")
-
 
 
 if __name__ == "__main__":

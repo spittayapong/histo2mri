@@ -15,7 +15,7 @@ import torch
 
 def _to_numpy_image(x):
     """Return a sitk image or array as numpy, dropping a leading singleton axis."""
-    if sitk is not None and isinstance(x, sitk.Image):
+    if isinstance(x, sitk.Image):
         arr = sitk.GetArrayFromImage(x)
     else:
         arr = np.asarray(x)
@@ -56,7 +56,7 @@ def _unfold_hw(t_hw, patch, stride):
 
 
 @torch.no_grad()
-def _mind_ssc_2d(img, radius=2, dilation=1, eps=1e-8):
+def _mind_2d(img, radius=2, dilation=1, eps=1e-8):
     """Compute a MIND-style self-similarity descriptor with 8 channels per pixel.
 
     For each of the 8 neighbour offsets (scaled by dilation), the squared
@@ -165,7 +165,7 @@ def _mind_desc_from_patch_batch(patches_bpp, masks_bp, radius=2, dilation=1, eps
     # patches_bpp: [B,p,p], masks_bp: [B,P] bool
     B, p, _ = patches_bpp.shape
     x = patches_bpp[:, None, :, :]  # [B,1,p,p]
-    d = _mind_ssc_2d(x, radius=radius, dilation=dilation, eps=eps)  # [B,D,p,p]
+    d = _mind_2d(x, radius=radius, dilation=dilation, eps=eps)  # [B,D,p,p]
     D = d.shape[1]
     d = d.reshape(B, D, p * p)
     d = d * masks_bp[:, None, :].to(d.dtype)

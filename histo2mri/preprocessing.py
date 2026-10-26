@@ -14,6 +14,9 @@ import SimpleITK as sitk
 from skimage import morphology
 from skimage.morphology import ball
 from .qc import show_proc_image
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def voxel_index_affine_hr_to_lr(spacing_hr, spacing_lr):
@@ -63,10 +66,10 @@ def resample_histo_to_mri(Ih_hr, Mh_hr, Im):
     hist_spacing = Ih_hr.GetSpacing()
     mri_spacing = Im.GetSpacing()
 
-    print("\n-------- Original Image Size --------")
-    print("MRI spacing:", mri_spacing)
-    print("Histology size:", hist_size)
-    print("Histology spacing:", hist_spacing)
+    logger.debug('-------- Original Image Size --------')
+    logger.debug('MRI spacing: %s', mri_spacing)
+    logger.debug('Histology size: %s', hist_size)
+    logger.debug('Histology spacing: %s', hist_spacing)
 
     # Compute new size so that physical size stays identical
     hist_size_new = [
@@ -173,13 +176,6 @@ def robust_intensity_prep(I, mask=None, pclip=(1, 99), eps=1e-8):
     else:
         I01_np = np.clip((I_np - lo) / denom, 0, 1).astype(np.float32)
 
-    stats = {
-        "lo": float(lo),
-        "hi": float(hi),
-        "mean": float(vals.mean()) if vals.size else float(I_np.mean()),
-        "std": float(vals.std(ddof=0)) if vals.size else float(I_np.std(ddof=0)),
-        "pclip": pclip,
-    }
 
     # --- Convert back to SimpleITK.Image if needed (preserve metadata)
     if is_sitk:
@@ -325,7 +321,7 @@ def prepare_histology(Ih, Mh, scale_ratio, patch_size, show_proc_img=False, save
         Tuple (proc_Ih, proc_Mh, A_lr_to_proc): prepared histology and mask
         (sitk.Image) and the 4x4 LR -> proc voxel-index affine.
     """
-    print("\n-------- Prepare Histology for Registration --------")
+    logger.debug('-------- Prepare Histology for Registration --------')
 
     sy, sx = scale_ratio
 
@@ -398,7 +394,7 @@ def prepare_mri_slab(Im, Mm, n_slices, show_proc_img=False, save_file=None, pcli
         Tuple (slab_raw_Im, slab_Im, slab_Mm): the unmodified MRI, the
         normalised MRI and the dilated mask, all sitk.Image.
     """
-    print("\n-------- Prepare MRI Slab for Registration --------")
+    logger.debug('-------- Prepare MRI Slab for Registration --------')
 
     slab_Mm = dilate_mask(Mm, ball_size=1)
     slab_raw_Im = Im

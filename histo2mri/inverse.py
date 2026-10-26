@@ -34,6 +34,9 @@ from scipy.ndimage import (
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 from .qc import plot_mri_on_histology
 from .sampling import sample_mri_cubic_3d
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def make_A_proc_to_scaled(proc_Ih, scaled_proc_Ih):
@@ -51,7 +54,7 @@ def make_A_proc_to_scaled(proc_Ih, scaled_proc_Ih):
         4x4 float64 array mapping homogeneous (x, y, z, 1) proc pixel indices
         to scaled pixel indices; z is left unchanged.
     """
-    sx =scaled_proc_Ih.GetSize()[0] / proc_Ih.GetSize()[0]
+    sx = scaled_proc_Ih.GetSize()[0] / proc_Ih.GetSize()[0]
     sy = scaled_proc_Ih.GetSize()[1] / proc_Ih.GetSize()[1]
     A = np.eye(4, dtype=np.float64)
     A[0, 0] = sx
@@ -73,7 +76,7 @@ def make_A_scaled_to_common(oy, ox):
         4x4 float64 array mapping homogeneous (x, y, z, 1) scaled pixel indices
         to common-canvas pixel indices.
     """
-    A =np.eye(4, dtype=np.float64)
+    A = np.eye(4, dtype=np.float64)
     A[0, 3] = float(ox)  # x shift
     A[1, 3] = float(oy)  # y shift
     return A
@@ -229,13 +232,7 @@ def inverse_surface_image_to_hr(
     out[~target_valid] = 0
     wgt[~target_valid] = 0
 
-    print(
-        f"[inverse_surface_image_to_hr] "
-        f"src_valid={valid.sum()} "
-        f"proj_inside={inside.sum()} "
-        f"support={(wgt > 1e-6).sum()} "
-        f"support_frac={(wgt > 1e-6).mean():.8f}"
-    )
+    logger.debug(f'[inverse_surface_image_to_hr] src_valid={valid.sum()} proj_inside={inside.sum()} support={(wgt > 1e-06).sum()} support_frac={(wgt > 1e-06).mean():.8f}')
 
     if return_weight:
         return out, wgt
@@ -265,8 +262,7 @@ def _scale_from_affine(A):
     A = np.asarray(A, dtype=np.float64)
     off = abs(A[0, 1]) + abs(A[1, 0])
     if off > 1e-6 * (abs(A[0, 0]) + abs(A[1, 1]) + 1e-12):
-        print(f"[inverse_to_histo_v12] WARNING: A_common_to_hr has off-diagonal terms "
-              f"({A[0, 1]:.3e}, {A[1, 0]:.3e}); |diag| is not the true scale.")
+        logger.warning(f'A_common_to_hr has off-diagonal terms ({A[0, 1]:.3e}, {A[1, 0]:.3e}); |diag| is not the true scale.')
     return max(1.0, float(abs(A[0, 0]))), max(1.0, float(abs(A[1, 1])))
 
 
@@ -361,7 +357,7 @@ def build_target_valid_mask(
     yy, xx = np.where(arr_Mh_hr)
     if yy.size == 0:
         if verbose:
-            print("[target_valid_mask] histology mask is empty")
+            logger.warning('[target_valid_mask] histology mask is empty')
         return np.zeros_like(arr_Mh_hr, dtype=bool), support_w_hr
 
     sx, sy = _scale_from_affine(A_common_to_hr)
@@ -405,9 +401,7 @@ def build_target_valid_mask(
     target_valid_mask[hr_y0:hr_y1, hr_x0:hr_x1] = mask_roi
 
     if verbose:
-        print(f"[target_valid_mask] hr scale (sx,sy) = ({sx:.1f}, {sy:.1f})  "
-              f"roi = y[{hr_y0}:{hr_y1}] x[{hr_x0}:{hr_x1}]  "
-              f"coverage = {target_valid_mask.mean():.6f}")
+        logger.debug(f'[target_valid_mask] hr scale (sx,sy) = ({sx:.1f}, {sy:.1f})  roi = y[{hr_y0}:{hr_y1}] x[{hr_x0}:{hr_x1}]  coverage = {target_valid_mask.mean():.6f}')
 
     return target_valid_mask, support_w_hr
 
@@ -468,7 +462,7 @@ def resample_mri_to_hr(
     Hhr, Whr = _hr_2d(Ih_hr).shape
     Hs, Ws = _xyz.shape[:2]
     if verbose:
-        print(f"[resample_mri_to_hr] HR histology {Hhr} x {Whr}   surface {Hs} x {Ws}")
+        logger.debug(f'[resample_mri_to_hr] HR histology {Hhr} x {Whr}   surface {Hs} x {Ws}')
 
     surf_r, surf_c = np.where(_valid_display)
     if surf_r.size == 0:
@@ -577,8 +571,7 @@ def resample_mri_to_hr(
     mri_on_hr[~final_valid_hr] = 0.0
 
     if verbose:
-        print(f"[resample_mri_to_hr] surface_valid coverage = {surface_valid_hr.mean():.6f}   "
-              f"final_valid coverage = {final_valid_hr.mean():.6f}")
+        logger.info(f'[resample_mri_to_hr] surface_valid coverage = {surface_valid_hr.mean():.6f}   final_valid coverage = {final_valid_hr.mean():.6f}')
 
     return mri_on_hr, surface_valid_hr, final_valid_hr
 
@@ -645,7 +638,7 @@ def mri_on_histology_space(
             info: dict with target_valid_mask, surface_valid_hr, support_w_hr,
                 Hhr and Whr.
     """
-    print("\n-------- MRI on Histology Space --------")
+    logger.debug('-------- MRI on Histology Space --------')
 
     A_hr_to_common, A_common_to_hr = build_hr_common_affines(
         proc_Ih, scaled_proc_Ih, A_hr_to_proc, oy_h, ox_h

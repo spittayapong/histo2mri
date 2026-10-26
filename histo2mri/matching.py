@@ -12,6 +12,9 @@ import torch
 from tqdm import tqdm
 import inspect
 from .features import _hog_from_unfolded, _mind_desc_from_patch_batch, _norm01_torch, _pairwise_masked_hog_similarity, _pairwise_masked_mind_similarity, _pairwise_masked_ngf_similarity, _prep_inputs, _sobel_xy, _to_np2d, _to_numpy_image, _unfold_hw
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @torch.no_grad()
@@ -91,7 +94,7 @@ def build_mri_bank_hog_mind_ngf(
     m_hog_list, m_mk_list, m_top_list, m_center_list, m_patch_list = [], [], [], [], []
     Z = mri_img.shape[0]
 
-    for z in tqdm(range(Z), desc="Build MRI bank"):
+    for z in tqdm(range(Z), desc="Build MRI bank", disable=not logger.isEnabledFor(logging.DEBUG)):
         if z_min is not None and z < z_min:
             continue
         if z_max is not None and z > z_max:
@@ -352,9 +355,6 @@ def run_patch_matching_hog_mind_fusion_gpu(
         h_gx_u, h_gy_u, h_mk_u, patch=patch, cell_size=cell_size, bins=bins
     )  # [Nh,Fh]
     h_patches = h_im_u.reshape(-1, patch, patch)  # [Nh,p,p]
-    h_mind = _mind_desc_from_patch_batch(
-        h_patches, h_mk_u, radius=mind_radius, dilation=mind_dilation
-    )  # [Nh,Fm]
     Nh = h_hog.shape[0]
 
     if mri_bank is None:
@@ -408,14 +408,13 @@ def run_patch_matching_hog_mind_fusion_gpu(
     best_score = torch.full((Nh,), -float("inf"), device=dev, dtype=torch.float32)
     best_idx = torch.full((Nh,), -1, device=dev, dtype=torch.long)
 
-    for hs in tqdm(range(0, Nh, hist_batch), desc="Match HOG+MIND+NGF"):
+    for hs in tqdm(range(0, Nh, hist_batch), desc="Match HOG+MIND+NGF", disable=not logger.isEnabledFor(logging.DEBUG)):
         he = min(hs + hist_batch, Nh)
         Hb = he - hs
 
         hh = h_hog[hs:he].to(torch.float32)             # [Hb,Fh] dev
         hmasks = h_mk_u[hs:he]                          # [Hb,P] bool dev
         hmasks_f = hmasks.to(torch.float32)             # [Hb,P] float dev
-        hmind = h_mind[hs:he].to(torch.float32)         # [Hb,Fm] dev
         hpatches = h_patches[hs:he].to(torch.float32)   # [Hb,p,p] dev
 
         run_vals = torch.full((Hb, topk_hog), -float("inf"), device=dev, dtype=torch.float32)
@@ -655,7 +654,7 @@ def _rb_pad_len(L, patch, stride):
 
 def _pad2d_rb(arr2d, patch, stride):
     """Zero-pad a 2D array at the bottom and right; return (padded, (pad_y, pad_x))."""
-    ph =_rb_pad_len(arr2d.shape[0], patch, stride)
+    ph = _rb_pad_len(arr2d.shape[0], patch, stride)
     pw = _rb_pad_len(arr2d.shape[1], patch, stride)
     if ph == 0 and pw == 0:
         return arr2d, (0, 0)
@@ -665,7 +664,7 @@ def _pad2d_rb(arr2d, patch, stride):
 
 def _pad3d_zyx_rb(vol, patch, stride):
     """Zero-pad a (z, y, x) volume at the bottom (y) and right (x); return (padded, (pad_y, pad_x))."""
-    ph =_rb_pad_len(vol.shape[1], patch, stride)  # Y
+    ph = _rb_pad_len(vol.shape[1], patch, stride)  # Y
     pw = _rb_pad_len(vol.shape[2], patch, stride)  # X
     if ph == 0 and pw == 0:
         return vol, (0, 0)
@@ -769,21 +768,11 @@ def match_patches(
 
 # ---------- coarse scale search ----------
 def _filter_cfg_for_matcher(cfg, matcher_fn):
-    """Adapt a matcher config dict to matcher_fn's signature (rename batch keys, drop unknown keys).
-
-    Unknown keys are kept if matcher_fn accepts **kwargs.
-    """
-    sig =inspect.signature(matcher_fn)
-    params = sig.parameters
+    """Drop config keys that matcher_fn does not accept (all are kept if it accepts **kwargs)."""
+    params = inspect.signature(matcher_fn).parameters
     accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
     out = dict(cfg)
-
-    if "hist_kernel_batch" in params and "hist_batch" in out:
-        out["hist_kernel_batch"] = out.pop("hist_batch")
-    if "mri_chunk_size" in params and "mri_chunk" in out:
-        out["mri_chunk_size"] = out.pop("mri_chunk")
-
     if accepts_var_kw:
         return out
     return {k: v for k, v in out.items() if k in params}
@@ -848,7 +837,7 @@ def build_mri_bank_hog_mind(
     m_hog_list, m_mk_list, m_top_list, m_center_list, m_patch_list = [], [], [], [], []
     Z = mri_img.shape[0]
 
-    for z in tqdm(range(Z), desc="Build MRI bank"):
+    for z in tqdm(range(Z), desc="Build MRI bank", disable=not logger.isEnabledFor(logging.DEBUG)):
         if z_min is not None and z < z_min:
             continue
         if z_max is not None and z > z_max:
@@ -1100,7 +1089,7 @@ def run_patch_matching_hog_mind_fusion_gpu_cached(
     best_score = torch.full((Nh,), -float("inf"), device=dev, dtype=torch.float32)
     best_idx = torch.full((Nh,), -1, device=dev, dtype=torch.long)
 
-    for hs in tqdm(range(0, Nh, hist_batch), desc="Match HOG+MIND"):
+    for hs in tqdm(range(0, Nh, hist_batch), desc="Match HOG+MIND", disable=not logger.isEnabledFor(logging.DEBUG)):
         he = min(hs + hist_batch, Nh)
         Hb = he - hs
         hh = h_hog[hs:he].to(torch.float32)
@@ -1215,7 +1204,7 @@ def run_patch_matching_hog_mind_fusion_gpu_with_border_cached(
     Returns:
         The cached matcher's output dict plus padding_info, as in match_patches.
     """
-    Ih =_to_numpy_image(proc_Ih).astype(np.float32)
+    Ih = _to_numpy_image(proc_Ih).astype(np.float32)
     Mh = (_to_numpy_image(histo_mask) > 0)
     if Ih.ndim == 3: Ih = Ih[0]
     if Mh.ndim == 3: Mh = Mh[0]
@@ -1319,7 +1308,7 @@ def search_scale(
     )
     run_cfg.update(common_kwargs)  # user overrides defaults if needed
     run_cfg = _filter_cfg_for_matcher(run_cfg, matcher_fn)
-    print(run_cfg)
+    logger.debug(run_cfg)
 
     # -------- Build the MRI bank once: mri_patch/mri_stride never change across the scale loop --------
     Im = _to_numpy_image(slab_Im).astype(np.float32)
@@ -1350,7 +1339,7 @@ def search_scale(
         hs, ms = resize_hist_pair(hist_img, hist_msk, float(s))
 
         if verbose:
-            print(f"[scale={s:.3f}] running...")
+            logger.debug(f'[scale={s:.3f}] running...')
 
         out = matcher_fn(
             proc_Ih=hs,
@@ -1381,7 +1370,7 @@ def search_scale(
         )
         records.append(rec)
         if verbose:
-            print(rec)
+            logger.debug(rec)
 
         if sc > best["score"]:
             best = dict(
@@ -1525,11 +1514,7 @@ def evaluate_fixed_scale_multi_patch(
             }
             results.append(res)
 
-            print(
-                f"[patch={p}] robust_score={score:.4f}, "
-                f"n_matches={len(out['matches'])}, "
-                f"padding={compact_out['padding_info']}"
-            )
+            logger.debug(f"[patch={p}] robust_score={score:.4f}, n_matches={len(out['matches'])}, padding={compact_out['padding_info']}")
 
             del compact_out
             del out
@@ -1544,7 +1529,7 @@ def evaluate_fixed_scale_multi_patch(
                 libc.malloc_trim(0)
 
         except Exception as e:
-            print(f"[patch={p}] ERROR: {type(e).__name__}: {str(e)[:120]}")
+            logger.warning(f'[patch={p}] ERROR: {type(e).__name__}: {str(e)[:120]}')
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -1556,10 +1541,7 @@ def evaluate_fixed_scale_multi_patch(
 
     results = sorted(results, key=lambda r: r["robust_score"], reverse=True)
 
-    print("\nBest config:", {
-        k: results[0][k]
-        for k in ["patch", "hist_stride", "mri_stride", "robust_score", "n_matches"]
-    })
+    logger.info('Best config: %s', {k: results[0][k] for k in ['patch', 'hist_stride', 'mri_stride', 'robust_score', 'n_matches']})
     return results
 
 
@@ -1578,7 +1560,7 @@ def score_stability(matches, top_frac=0.30, min_keep=10):
         dict with n (number of finite scores), median, iqr, p10, p90 of all finite scores, and
         median_top, iqr_top of the top set. All statistics are NaN if there is no finite score.
     """
-    s =np.array([m["score"] for m in matches], dtype=np.float32)
+    s = np.array([m["score"] for m in matches], dtype=np.float32)
     s = s[np.isfinite(s)]
     if s.size == 0:
         return dict(n=0, median=np.nan, iqr=np.nan, p10=np.nan, p90=np.nan, median_top=np.nan, iqr_top=np.nan)
@@ -1600,7 +1582,7 @@ def score_stability(matches, top_frac=0.30, min_keep=10):
 # ---------- Affine RANSAC (no external deps) ----------
 def _fit_affine_xy(src_xy, dst_xy):
     """Least-squares 2D affine M (2x3) with dst = M @ [x, y, 1]; src_xy and dst_xy are [N, 2]."""
-    N =src_xy.shape[0]
+    N = src_xy.shape[0]
     X = np.zeros((2 * N, 6), dtype=np.float64)
     y = np.zeros((2 * N,), dtype=np.float64)
 
@@ -1691,7 +1673,7 @@ def ransac_affine_from_matches(
         return dict(ok=False, reason="too_few_after_z_filter")
 
     rng = np.random.default_rng(seed)
-    best_inliers, best_count, best_mederr, best_M = None, -1, np.inf, None
+    best_inliers, best_count, best_mederr = None, -1, np.inf
 
     for _ in range(n_iter):
         sample = rng.choice(N, size=min_samples, replace=False)
@@ -1704,7 +1686,7 @@ def ransac_affine_from_matches(
             continue
         mederr = float(np.median(err[inliers]))
         if (cnt > best_count) or (cnt == best_count and mederr < best_mederr):
-            best_count, best_mederr, best_inliers, best_M = cnt, mederr, inliers, M
+            best_count, best_mederr, best_inliers = cnt, mederr, inliers
 
     if best_inliers is None:
         return dict(ok=False, reason="no_model")
@@ -1755,7 +1737,7 @@ def compare_patch_results_ransac(
     for r in res_list:
         matches = r["_out"]["matches"]
         # Score distribution statistics (tie-breakers in the ranking below)
-        st =score_stability(matches, top_frac=top_frac)
+        st = score_stability(matches, top_frac=top_frac)
         rr = ransac_affine_from_matches(
             matches,
             reproj_thresh=reproj_thresh,
@@ -1795,14 +1777,9 @@ def compare_patch_results_ransac(
         reverse=True,
     )
 
-    print("=== Patch config comparison (best first) ===")
+    logger.debug('=== Patch config comparison (best first) ===')
     for i, d in enumerate(rows_sorted):
-        print(
-            f"[{i}] patch={d['patch']:>3} hs={d['hist_stride']:>2} ms={d['mri_stride']:>2} | "
-            f"inliers={d['inlier_count']:>4}/{d['n_matches']:<4} ({d['inlier_ratio']:.3f}) | "
-            f"med_reproj={d['median_reproj']:.2f} | "
-            f"score_top_med={d['score_median_top']:.4f} score_top_iqr={d['score_iqr_top']:.4f}"
-        )
+        logger.debug(f"[{i}] patch={d['patch']:>3} hs={d['hist_stride']:>2} ms={d['mri_stride']:>2} | inliers={d['inlier_count']:>4}/{d['n_matches']:<4} ({d['inlier_ratio']:.3f}) | med_reproj={d['median_reproj']:.2f} | score_top_med={d['score_median_top']:.4f} score_top_iqr={d['score_iqr_top']:.4f}")
     return rows_sorted
 
 
@@ -1826,7 +1803,7 @@ def z_band_from_inliers(inlier_matches, k_mad=3.0, min_radius=8):
     Raises:
         RuntimeError: If no match has a valid slice index.
     """
-    z =np.array([m["mri_center_zyx"][0] for m in inlier_matches], dtype=np.int32)
+    z = np.array([m["mri_center_zyx"][0] for m in inlier_matches], dtype=np.int32)
     z = z[z >= 0]
     if len(z) == 0:
         raise RuntimeError("No valid z in inlier_matches.")
@@ -1859,9 +1836,6 @@ def rescale_histology(proc_Ih, proc_Mh, best_scale, preserve_physical_size=True)
     Returns:
         Tuple (h_scaled, m_scaled) of SimpleITK images: float32 image and uint8 {0, 1} mask.
     """
-    if sitk is None:
-        raise ImportError("SimpleITK is required for returning SITK images.")
-
     is_h_sitk = isinstance(proc_Ih, sitk.Image)
     is_m_sitk = isinstance(proc_Mh, sitk.Image)
 
@@ -1982,14 +1956,17 @@ def search_patch_config(
     # Best-ranked configuration
     best_row = rows_sorted[0]
     best_out = best_row["_out"]
-    best_inliers = best_row["_ransac"]["inlier_idx"] if best_row["_ransac"]["ok"] else []
+    if not best_row["_ransac"]["ok"]:
+        raise ValueError("Patch-configuration search failed: no configuration gave a RANSAC "
+                         f"model ({best_row['_ransac'].get('reason', 'unknown reason')})")
+    best_inliers = best_row["_ransac"]["inlier_idx"]
 
-    print("Chosen config:", best_row["patch"], best_row["hist_stride"], best_row["mri_stride"])
-    print("Inliers:", len(best_inliers))
+    logger.info('Chosen patch config: patch=%s hist_stride=%s mri_stride=%s', best_row['patch'], best_row['hist_stride'], best_row['mri_stride'])
+    logger.info('Inliers: %s', len(best_inliers))
 
     inlier_matches = [best_out["matches"][i] for i in best_inliers]
     z_center, z_min, z_max, z_radius = z_band_from_inliers(inlier_matches)
-    print("z_center:", z_center, "z_min:", z_min, "z_max:", z_max, "z_radius:", z_radius)
+    logger.info('z_center: %s z_min: %s z_max: %s z_radius: %s', z_center, z_min, z_max, z_radius)
 
     return best_row["patch"], best_row["hist_stride"], best_row["mri_stride"], z_center, z_min, z_max
 

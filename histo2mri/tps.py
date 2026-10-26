@@ -15,6 +15,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple
 from .plane import hist_xy_from_G_uv, xyz_from_G_uv
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def _tps_kernel_r2logr_2d(r2, eps=1e-9):
@@ -557,7 +560,7 @@ def fit_tps_robust(
             or an unknown method or score type is given.
         KeyError: if G lacks the in-plane transform keys.
     """
-    print(f"\n-------- Estimate Initial Curved Sheet (method={method}) --------")
+    logger.debug(f'-------- Estimate Initial Curved Sheet (method={method}) --------')
     device = torch.device(device)
 
     # Control points: histology (x, y) mapped to (u, v) through G, and MRI (x, y, z).
@@ -685,7 +688,7 @@ def fit_tps_robust(
                 break
 
     if best_inlier_mask is None:
-        print("RANSAC TPS: no valid hypothesis found; falling back to all points.")
+        logger.warning('RANSAC TPS: no valid hypothesis found; falling back to all points.')
         best_inlier_mask = torch.ones(N, device=device, dtype=torch.bool)
 
     tps_final, uv_in, xyz_in, residuals_final = _final_refit(best_inlier_mask, lam_final)

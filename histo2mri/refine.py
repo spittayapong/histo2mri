@@ -70,6 +70,7 @@ Units. xyz_norm * (dim - 1) gives voxel-index coordinates. For isotropic voxels 
 differs from physical space by a uniform scale, which cancels in every ratio against the
 base surface, so no voxel spacing is needed. Anisotropic data would need a spacing weight.
 """
+import matplotlib
 import numpy as np
 import SimpleITK as sitk
 from scipy.spatial import cKDTree
@@ -78,10 +79,13 @@ import os
 import imageio.v2 as imageio
 import torch
 import torch.nn.functional as F
-from .bspline import BSplineFFD2D, BSplineResidualSurface3D, ScalarNormalOffsetField, _copy_ctrl, _upsample_ctrl, bending_energy, bending_energy_2d, sheet_inside_volume_penalty
+from .bspline import BSplineFFD2D, BSplineResidualSurface3D, ScalarNormalOffsetField, _copy_ctrl, _upsample_ctrl, bending_energy, sheet_inside_volume_penalty
 from .losses import _build_rigidity_weight, combined_masked_ssim_mind_loss, combined_masked_ssim_ngf_loss, first_fundamental_form, surface_area_ratio
 from .qc import _plot_surface
 from .sampling import _prepare_data_tensor, sample_mri_cubic_3d, sample_mri_on_sheet
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # Refinement
@@ -305,7 +309,7 @@ def _sheet_frame_like_tps(
 
     zmin, zmax = np.nanmin(Zp), np.nanmax(Zp)
     norm = plt.Normalize(zmin, zmax)
-    facecolors = plt.cm.get_cmap(cmap)(norm(Zp))
+    facecolors = matplotlib.colormaps[cmap](norm(Zp))
     ax.plot_surface(Xp, Yp, Zp, facecolors=facecolors, linewidth=0, antialiased=True, shade=False, alpha=alpha)
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
@@ -397,9 +401,9 @@ def pyramid_refinement(
         W: canvas width in pixels.
         levels: list of dicts, one per pyramid level (coarse to fine), with keys
             gh, gw: control-grid size;
-            nA, lrA, lamA: iterations, learning rate and bending weight for phi;
-            nB, lrB, lamB: the same for alpha;
-            nF, lrF, lamF: the same for rf_psi and rf_beta (one shared bending weight);
+            n_phi, lr_phi, lam_phi: iterations, learning rate and bending weight for phi;
+            n_alpha, lr_alpha, lam_alpha: the same for alpha;
+            n_rf, lr_rf, lam_rf: the same for rf_psi and rf_beta (one shared bending weight);
             lamSheet: weight of sheet_inside_volume_penalty;
             lamOut: weight of the squared normal offset outside the soft mask;
             lamRigid (optional, default 1.0): multiplier on the rigidity loss.
@@ -461,8 +465,7 @@ def pyramid_refinement(
         w_sum = w_rigid.sum().clamp_min(1e-8)
 
     rigid_on = (float(lam_area) > 0.0) or (float(lam_shape) > 0.0)
-    print(f"[v12 rigidity] mode={w_rigid_mode} lam_area={lam_area} lam_shape={lam_shape} "
-          f"active_px={int((w_rigid > 0).sum())}/{H*W}")
+    logger.debug(f'Rigidity: mode={w_rigid_mode} lam_area={lam_area} lam_shape={lam_shape} active_px={int((w_rigid > 0).sum())}/{H * W}')
 
     def _rigidity_terms(xyz_norm):
         """Return (L_area, L_shape) as w_rigid-weighted means; both are zero when the sheet keeps the base metric."""
@@ -495,8 +498,7 @@ def pyramid_refinement(
             if m.sum() == 0:
                 return
             p = np.percentile(r[m], [1, 5, 50, 95, 99])
-            print(f"    [{tag}] area ratio final/base p1,p5,p50,p95,p99 = "
-                  f"{p[0]:.3f} {p[1]:.3f} {p[2]:.3f} {p[3]:.3f} {p[4]:.3f}")
+            logger.debug(f'    [{tag}] area ratio final/base p1,p5,p50,p95,p99 = {p[0]:.3f} {p[1]:.3f} {p[2]:.3f} {p[3]:.3f} {p[4]:.3f}')
 
     xyz_base_img = xyz_norm_base.permute(2, 0, 1).unsqueeze(0).detach()   # [1,3,H,W]
     n0_base_img = n0_base.permute(2, 0, 1).unsqueeze(0).detach()          # [1,3,H,W]
@@ -563,15 +565,14 @@ def pyramid_refinement(
 
             if it % 50 == 0 or it == n_iter - 1:
                 metric_name = "ngf" if "ngf" in comp else "mind"
-                print(f"[{name}] it={it:04d}/{n_iter} loss={loss.item():.6f} img={loss_img.item():.6f} "
-                      f"{print_extra_fn(L_reg_terms)} ssim={comp['ssim']:.4f} {metric_name}={comp[metric_name]:.4f}")
+                logger.debug(f"[{name}] it={it:04d}/{n_iter} loss={loss.item():.6f} img={loss_img.item():.6f} {print_extra_fn(L_reg_terms)} ssim={comp['ssim']:.4f} {metric_name}={comp[metric_name]:.4f}")
 
             if loss.item() < best_loss:
                 best_loss, no_improve = loss.item(), 0
             else:
                 no_improve += 1
             if no_improve >= patience:
-                print(f"[{name}] Early stopping at it={it} (no improvement for {patience} iters)")
+                logger.debug(f'[{name}] Early stopping at it={it} (no improvement for {patience} iters)')
                 break
 
     phi = None
@@ -579,7 +580,7 @@ def pyramid_refinement(
     rf_psi = None
     rf_beta = None
 
-    print("===== Pyramid refinement v11: phi (velocity) + alpha (normal) + rf_psi (gated velocity) + rf_beta (gated normal) =====")
+    logger.debug('===== Pyramid refinement: phi (velocity) + alpha (normal) + rf_psi (gated velocity) + rf_beta (gated normal) =====')
     for li, cfg in enumerate(levels):
         gh, gw = cfg["gh"], cfg["gw"]
 
@@ -617,7 +618,7 @@ def pyramid_refinement(
             disp_psi_fix = _scaling_and_squaring_2d(gate3 * rf_psi(uv_norm_pix, H=H, W=W), n_steps=rf_psi_n_steps)
             rf_beta_fix = gate3 * rf_beta(uv_norm_pix, H=H, W=W)
 
-        print(f"\n--- Level {li} ({gh}x{gw}) Step Phi ---")
+        logger.debug(f'--- Level {li} ({gh}x{gw}) Step Phi ---')
 
         def _build_phi():
             v = phi(uv_norm_pix, H=H, W=W)
@@ -629,14 +630,14 @@ def pyramid_refinement(
             return xyz_norm, None
 
         def _reg_phi(xyz_norm, _):
-            L_bend = bending_energy_2d(phi.ctrl)
+            L_bend = bending_energy(phi.ctrl)
             L_sheet = sheet_inside_volume_penalty(xyz_norm)
             (L_area, L_shape), L_rigid = _rigidity_loss(xyz_norm, cfg)
             return (L_bend, L_sheet, L_area, L_shape),\
-                   cfg["lamA"] * L_bend + cfg["lamSheet"] * L_sheet + L_rigid
+                   cfg["lam_phi"] * L_bend + cfg["lamSheet"] * L_sheet + L_rigid
 
         _run_block(
-            f"L{li} Phi", phi.parameters(), cfg["lrA"], cfg["nA"],
+            f"L{li} Phi", phi.parameters(), cfg["lr_phi"], cfg["n_phi"],
             _build_phi, _reg_phi,
             lambda t: f"bend={t[0].item():.2e} sheet={t[1].item():.2e} area={t[2].item():.2e} shape={t[3].item():.2e}"
         )
@@ -650,7 +651,7 @@ def pyramid_refinement(
             xyz_resampled_fix, n0_resampled_fix = _resample_surface(grid2d_fix)
             rf_beta_fix = gate3 * rf_beta(uv_norm_pix, H=H, W=W)
 
-        print(f"--- Level {li} ({gh}x{gw}) Step Alpha ---")
+        logger.debug(f'--- Level {li} ({gh}x{gw}) Step Alpha ---')
 
         def _build_alpha():
             a = alpha(uv_norm_pix, H=H, W=W)
@@ -665,10 +666,10 @@ def pyramid_refinement(
             # tilts the sheet at zero bending cost, which stretches local area.
             (L_area, L_shape), L_rigid = _rigidity_loss(xyz_norm, cfg)
             return (L_bend, L_sheet, L_out, L_area, L_shape),\
-                   cfg["lamB"] * L_bend + cfg["lamSheet"] * L_sheet + cfg["lamOut"] * L_out + L_rigid
+                   cfg["lam_alpha"] * L_bend + cfg["lamSheet"] * L_sheet + cfg["lamOut"] * L_out + L_rigid
 
         _run_block(
-            f"L{li} Alpha", alpha.parameters(), cfg["lrB"], cfg["nB"],
+            f"L{li} Alpha", alpha.parameters(), cfg["lr_alpha"], cfg["n_alpha"],
             _build_alpha, _reg_alpha,
             lambda t: f"bend={t[0].item():.2e} sheet={t[1].item():.2e} out={t[2].item():.2e} area={t[3].item():.2e} shape={t[4].item():.2e}"
         )
@@ -680,7 +681,7 @@ def pyramid_refinement(
             grid2d_phi_fix = grid_id_2d + disp_fix.unsqueeze(0)
             a_fix = alpha(uv_norm_pix, H=H, W=W)
 
-        print(f"--- Level {li} ({gh}x{gw}) Step ResidualFree (rf_psi tangential + rf_beta normal, gated by 1-conf) ---")
+        logger.debug(f'--- Level {li} ({gh}x{gw}) Step ResidualFree (rf_psi tangential + rf_beta normal, gated by 1-conf) ---')
 
         def _build_rf():
             v_psi = rf_psi(uv_norm_pix, H=H, W=W)
@@ -692,17 +693,17 @@ def pyramid_refinement(
             return xyz_norm, rf_beta_gated
 
         def _reg_rf(xyz_norm, rf_beta_gated):
-            L_bend_psi = bending_energy_2d(rf_psi.ctrl)
+            L_bend_psi = bending_energy(rf_psi.ctrl)
             L_bend_beta = bending_energy(rf_beta.ctrl)
             L_sheet = sheet_inside_volume_penalty(xyz_norm)
             L_out = (rf_beta_gated[..., 0].pow(2) * (1.0 - mask_soft[0, 0])).mean()
             (L_area, L_shape), L_rigid = _rigidity_loss(xyz_norm, cfg)
             return (L_bend_psi, L_bend_beta, L_sheet, L_out, L_area, L_shape),\
-                   cfg["lamF"] * (L_bend_psi + L_bend_beta) + cfg["lamSheet"] * L_sheet\
+                   cfg["lam_rf"] * (L_bend_psi + L_bend_beta) + cfg["lamSheet"] * L_sheet\
                    + cfg["lamOut"] * L_out + L_rigid
 
         _run_block(
-            f"L{li} ResidualFree", list(rf_psi.parameters()) + list(rf_beta.parameters()), cfg["lrF"], cfg["nF"],
+            f"L{li} ResidualFree", list(rf_psi.parameters()) + list(rf_beta.parameters()), cfg["lr_rf"], cfg["n_rf"],
             _build_rf, _reg_rf,
             lambda t: f"bend_psi={t[0].item():.2e} bend_beta={t[1].item():.2e} sheet={t[2].item():.2e} "
                       f"out={t[3].item():.2e} area={t[4].item():.2e} shape={t[5].item():.2e}"
@@ -736,7 +737,7 @@ def pyramid_refinement(
         if save_file is not None:
             _plot_surface(
                 xyz_norm_final[..., 2],
-                "Pyramid refinement v11 – final surface (phi+alpha+gated rf_psi/rf_beta)",
+                "Pyramid refinement – final surface (phi+alpha+gated rf_psi/rf_beta)",
                 save_file=f"{save_file}_final.png",
             )
 
@@ -834,7 +835,7 @@ def refine_curved_sheet(
             rf_psi_refined: BSplineFFD2D, refined rf_psi (before gating).
             rf_beta_refined: ScalarNormalOffsetField, refined rf_beta (before gating).
     """
-    print("\n-------- Refine Curved Sheet (v12: + local rigidity) --------")
+    logger.debug('-------- Refine curved sheet --------')
 
     def _xyz_from_G_uv(uv_plane_flat, G, H, W, device):
         """Return the G-plane voxel positions X0 + u*e1 + v*e2 as a (H, W, 3) tensor."""
@@ -998,17 +999,17 @@ def refine_curved_sheet(
 
         _lr = list(lam_rigid_levels) + [lam_rigid_levels[-1]] * 3
         levels = [
-            dict(gh=12, gw=12, nA=100, lrA=2e-3, lamA=8e-4,
-                            nB=100, lrB=5e-4, lamB=1e-2,
-                            nF=60, lrF=2e-3, lamF=8e-3,
+            dict(gh=12, gw=12, n_phi=100, lr_phi=2e-3, lam_phi=8e-4,
+                            n_alpha=100, lr_alpha=5e-4, lam_alpha=1e-2,
+                            n_rf=60, lr_rf=2e-3, lam_rf=8e-3,
                             lamSheet=2e-3, lamOut=1e-2, lamRigid=_lr[0]),
-            dict(gh=24, gw=24, nA=120, lrA=1e-3, lamA=6e-4,
-                            nB=120, lrB=2.5e-4, lamB=7.5e-3,
-                            nF=30, lrF=1e-3, lamF=6e-3,
+            dict(gh=24, gw=24, n_phi=120, lr_phi=1e-3, lam_phi=6e-4,
+                            n_alpha=120, lr_alpha=2.5e-4, lam_alpha=7.5e-3,
+                            n_rf=30, lr_rf=1e-3, lam_rf=6e-3,
                             lamSheet=1.5e-3, lamOut=1e-2, lamRigid=_lr[1]),
-            dict(gh=32, gw=32, nA=140, lrA=7e-4, lamA=4e-4,
-                            nB=140, lrB=1.75e-4, lamB=5e-3,
-                            nF=40, lrF=7e-4, lamF=4e-3,
+            dict(gh=32, gw=32, n_phi=140, lr_phi=7e-4, lam_phi=4e-4,
+                            n_alpha=140, lr_alpha=1.75e-4, lam_alpha=5e-3,
+                            n_rf=40, lr_rf=7e-4, lam_rf=4e-3,
                             lamSheet=1e-3, lamOut=1e-2, lamRigid=_lr[2]),
         ]
 
@@ -1046,21 +1047,12 @@ def refine_curved_sheet(
                 mri_t, P_vox_xyz, kernel="catmull-rom", padding_mode="border"
             )[0, 0].detach().cpu().numpy()
 
-        if torch.is_tensor(xyz_norm_final):
-            valid_mri = (
-                torch.isfinite(xyz_norm_final).all(dim=-1) &
-                (xyz_norm_final[..., 0] >= 0) & (xyz_norm_final[..., 0] <= 1) &
-                (xyz_norm_final[..., 1] >= 0) & (xyz_norm_final[..., 1] <= 1) &
-                (xyz_norm_final[..., 2] >= 0) & (xyz_norm_final[..., 2] <= 1)
-            )
-        else:
-            xyz_norm_final = np.asarray(xyz_norm_final)
-            valid_mri = (
-                np.isfinite(xyz_norm_final).all(axis=-1) &
-                (xyz_norm_final[..., 0] >= 0) & (xyz_norm_final[..., 0] <= 1) &
-                (xyz_norm_final[..., 1] >= 0) & (xyz_norm_final[..., 1] <= 1) &
-                (xyz_norm_final[..., 2] >= 0) & (xyz_norm_final[..., 2] <= 1)
-            )
+        valid_mri = (
+            torch.isfinite(xyz_norm_final).all(dim=-1) &
+            (xyz_norm_final[..., 0] >= 0) & (xyz_norm_final[..., 0] <= 1) &
+            (xyz_norm_final[..., 1] >= 0) & (xyz_norm_final[..., 1] <= 1) &
+            (xyz_norm_final[..., 2] >= 0) & (xyz_norm_final[..., 2] <= 1)
+        )
 
         valid_out = valid_mri.detach().cpu().numpy()
 
@@ -1068,5 +1060,5 @@ def refine_curved_sheet(
     finally:
         if writer is not None:
             writer.close()
-            print(f"Saved GIF to: {gif_file}")
+            logger.debug(f'Saved GIF to: {gif_file}')
 

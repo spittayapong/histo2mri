@@ -274,9 +274,9 @@ def matches_to_common_canvas(clean_matches, oy_h, ox_h):
     """Shift histology match centres from the histology image into the common canvas.
 
     Matches without ``mri_center_zyx`` or ``hist_center_yx``, or whose MRI point is
-    (-1, -1, -1), are dropped. Each kept match is copied and only its ``hist_center_yx`` is
-    shifted; all other keys, including ``hist_topleft_yx`` and the MRI coordinates, are
-    copied unchanged.
+    (-1, -1, -1), are dropped. Each kept match is copied and its histology coordinates
+    (``hist_center_yx`` and, if present, ``hist_topleft_yx``) are shifted; all other keys,
+    including the MRI coordinates, are copied unchanged.
 
     Args:
         clean_matches: list of match dicts with ``hist_center_yx`` in histology pixels.
@@ -301,6 +301,9 @@ def matches_to_common_canvas(clean_matches, oy_h, ox_h):
 
         mm = dict(m)
         mm["hist_center_yx"] = (float(hyc), float(hxc))
+        if "hist_topleft_yx" in m:
+            ty, tx = m["hist_topleft_yx"]
+            mm["hist_topleft_yx"] = (float(ty + oy_h), float(tx + ox_h))
         # mri_center_zyx stays in MRI slab voxels.
         clean_matches_common.append(mm)
 
