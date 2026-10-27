@@ -99,16 +99,20 @@ def warm_start_residual_ctrl_from_matches(
     For each valid match, the histology position is mapped to plane coordinates (u, v)
     through the inverse of G's in-plane similarity, (u, v) = A2^-1 (xy - t_xy), and the
     TPS surface is evaluated there. The target is the MRI match position minus the TPS
-    position, normalised per axis by (dim - 1). The residual is evaluated at the match's
-    histology pixel position normalised by (W - 1, H - 1), and its control points are
-    fitted with Adam on a smooth-L1 loss plus lam_bend * bending_energy. Matches without
+    position, normalised per axis by (dim - 1). The residual is fitted at the canvas pixel
+    where the match lies on the sheet, i.e. the canvas pixel of plane point (u, v) (the
+    inverse of the pixel -> plane mapping of prepare_coords_from_G_canvas), normalised by
+    (W - 1, H - 1); this is the grid on which refine_curved_sheet evaluates the residual.
+    Its control points are fitted with Adam on a smooth-L1 loss plus
+    lam_bend * bending_energy. Matches without
     both keys, or with an MRI position of (-1, -1, -1), are skipped.
 
     Args:
         residual: BSplineResidualSurface3D whose control points are optimised in place.
         init_tps: callable mapping a (N, 2) tensor of plane (u, v) to (N, 3) MRI voxel
             positions (x, y, z).
-        init_G: global plane dict; uses "t_xy" and "A2_invT".
+        init_G: global plane dict; uses "t_xy", "A2_invT", "x_range", "y_range",
+            "plane_step" and, if present, "canvas_offset_yx".
         matches: list of match dicts.
         H: common-canvas height in pixels.
         W: common-canvas width in pixels.
@@ -157,11 +161,23 @@ def warm_start_residual_ctrl_from_matches(
             dxyz[:, 2] / max(Zdim - 1, 1),
         ], dim=1)                           # normalized residual vector
 
-    # residual model domain is normalized hist pixel coords [0,1]
-    uv_norm = torch.stack([
-        U[:, 0] / max(W - 1, 1),
-        U[:, 1] / max(H - 1, 1),
-    ], dim=1)
+    # Fit the residual where each match lies on the sheet. refine_curved_sheet evaluates it on
+    # the canvas grid, and canvas pixel (x, y) is plane point
+    # (u, v) = ((x - ox) * step + u0, (y - oy) * step + v0) (prepare_coords_from_G_canvas), so
+    # the match's canvas pixel is that mapping inverted at uv_ctrl. (Using the histology pixel U
+    # instead misplaces the fit by G's in-plane similarity: a median of ~17 px on the
+    # evaluation sections.)
+    u0, v0 = float(init_G["x_range"][0]), float(init_G["y_range"][0])
+    step = float(init_G.get("plane_step", 1.0))
+    Wm = int(round((float(init_G["x_range"][1]) - u0) / step)) + 1
+    Hm = int(round((float(init_G["y_range"][1]) - v0) / step)) + 1
+    if "canvas_offset_yx" in init_G:
+        oy, ox = map(int, init_G["canvas_offset_yx"])
+    else:
+        oy, ox = (H - Hm) // 2, (W - Wm) // 2
+    px = (uv_ctrl[:, 0] - u0) / step + ox
+    py = (uv_ctrl[:, 1] - v0) / step + oy
+    uv_norm = torch.stack([px / max(W - 1, 1), py / max(H - 1, 1)], dim=1)
 
     opt = torch.optim.Adam(residual.parameters(), lr=lr)
     for _ in range(n_iter):
