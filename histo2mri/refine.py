@@ -71,6 +71,7 @@ differs from physical space by a uniform scale, which cancels in every ratio aga
 base surface, so no voxel spacing is needed. Anisotropic data would need a spacing weight.
 """
 import matplotlib
+import warnings
 import numpy as np
 import SimpleITK as sitk
 from scipy.spatial import cKDTree
@@ -82,7 +83,7 @@ import torch.nn.functional as F
 from .bspline import BSplineFFD2D, BSplineResidualSurface3D, ScalarNormalOffsetField, _copy_ctrl, _upsample_ctrl, bending_energy, sheet_inside_volume_penalty
 from .losses import _build_rigidity_weight, combined_masked_ssim_mind_loss, combined_masked_ssim_ngf_loss, first_fundamental_form, surface_area_ratio
 from .qc import _plot_surface
-from .sampling import _prepare_data_tensor, sample_mri_cubic_3d, sample_mri_on_sheet
+from .sampling import grid_sample_2d_det, _prepare_data_tensor, sample_mri_cubic_3d, sample_mri_on_sheet
 import logging
 
 logger = logging.getLogger(__name__)
@@ -544,7 +545,7 @@ def pyramid_refinement(
         for _ in range(n_steps):
             d_img = d.permute(2, 0, 1).unsqueeze(0)                     # (1,2,H,W)
             query = grid_id_2d + d.unsqueeze(0)                         # (1,H,W,2)
-            d_warped = F.grid_sample(d_img, query, mode="bilinear", padding_mode="border", align_corners=True)
+            d_warped = grid_sample_2d_det(d_img, query, padding_mode="border")
             d = d + d_warped[0].permute(1, 2, 0)                        # (H,W,2)
         return d
 
@@ -554,7 +555,7 @@ def pyramid_refinement(
         # velocity), evaluated at base_grid2d's positions and added on top. This composes
         # "extra" after "base" (extra_map o base_map), which is diffeomorphic if both are.
         extra_img = extra_disp.permute(2, 0, 1).unsqueeze(0)                # (1,2,H,W)
-        extra_at_base = F.grid_sample(extra_img, base_grid2d, mode="bilinear", padding_mode="border", align_corners=True)
+        extra_at_base = grid_sample_2d_det(extra_img, base_grid2d, padding_mode="border")
         return base_grid2d + extra_at_base.permute(0, 2, 3, 1)              # (1,H,W,2)
 
     def _run_block(name, params, lr, n_iter, build_xyz_fn, reg_fn, print_extra_fn):
@@ -1029,28 +1030,43 @@ def refine_curved_sheet(
                             lamSheet=1e-3, lamOut=1e-2, lamRigid=_lr[2]),
         ]
 
-        phi_refined, alpha_refined, rf_psi_refined, rf_beta_refined, xyz_norm_final = pyramid_refinement(
-            mri_t=mri_t,
-            mri_mask_t=mri_mask_t,
-            hist_t=hist_t,
-            hist_mask_t=hist_mask_t,
-            xyz_norm_base=xyz_norm_base,
-            n0_base=n0,
-            conf=conf,
-            uv_norm_pix=uv_norm_pix,
-            grid_id_2d=grid_id_2d,
-            H=H, W=W,
-            levels=levels,
-            device=device,
-            save_file=save_file,
-            frame_cb=_frame_cb if writer is not None else None,
-            frame_every=gif_every,
-            lam_area=lam_area,
-            lam_shape=lam_shape,
-            w_rigid_mode=w_rigid_mode,
-            rigid_edge_k=rigid_edge_k,
-            similarity_weights=similarity_weights,
-        )
+        # Deterministic refinement, so repeated runs give identical results. F.grid_sample
+        # accumulates the gradient w.r.t. its input with GPU atomic adds (run-to-run noise);
+        # the two calls that need that gradient use grid_sample_2d_det, whose gather backward
+        # is deterministic in torch's deterministic mode. The remaining grid_sample calls only
+        # differentiate w.r.t. the grid, which is deterministic, so their warnings are
+        # silenced. The caller's deterministic-mode setting is restored afterwards.
+        _det_prev = torch.are_deterministic_algorithms_enabled()
+        _det_prev_warn = torch.is_deterministic_algorithms_warn_only_enabled()
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=r"grid_sampler_.*_backward_cuda does not have a deterministic")
+                warnings.filterwarnings("ignore", message=r".*CUBLAS_WORKSPACE_CONFIG.*")
+                phi_refined, alpha_refined, rf_psi_refined, rf_beta_refined, xyz_norm_final = pyramid_refinement(
+                    mri_t=mri_t,
+                    mri_mask_t=mri_mask_t,
+                    hist_t=hist_t,
+                    hist_mask_t=hist_mask_t,
+                    xyz_norm_base=xyz_norm_base,
+                    n0_base=n0,
+                    conf=conf,
+                    uv_norm_pix=uv_norm_pix,
+                    grid_id_2d=grid_id_2d,
+                    H=H, W=W,
+                    levels=levels,
+                    device=device,
+                    save_file=save_file,
+                    frame_cb=_frame_cb if writer is not None else None,
+                    frame_every=gif_every,
+                    lam_area=lam_area,
+                    lam_shape=lam_shape,
+                    w_rigid_mode=w_rigid_mode,
+                    rigid_edge_k=rigid_edge_k,
+                    similarity_weights=similarity_weights,
+                )
+        finally:
+            torch.use_deterministic_algorithms(_det_prev, warn_only=_det_prev_warn)
 
         with torch.no_grad():
             P_vox_xyz = torch.stack([

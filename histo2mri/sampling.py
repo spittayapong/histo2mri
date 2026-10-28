@@ -37,6 +37,46 @@ def _prepare_data_tensor(sitk_img, device):
     return tensor.unsqueeze(0)                    # prepend batch -> (1, C, ...)
 
 
+def grid_sample_2d_det(inp, grid, padding_mode="border"):
+    """Bilinear 2D sampling equal to F.grid_sample(..., align_corners=True), but deterministic.
+
+    F.grid_sample computes the gradient with respect to its input with atomic additions on
+    the GPU, so repeated runs differ slightly. This version gathers the four neighbours
+    explicitly; the gradient of torch.gather is deterministic when
+    torch.use_deterministic_algorithms(True) is active (see refine.pyramid_refinement).
+
+    Args:
+        inp: Tensor (N, C, H, W).
+        grid: Tensor (N, Ho, Wo, 2), normalised (x, y) in [-1, 1] (align_corners=True).
+        padding_mode: "border" (coordinates clamped to the image) or "zeros".
+
+    Returns:
+        Tensor (N, C, Ho, Wo).
+    """
+    N, C, H, W = inp.shape
+    Ho, Wo = grid.shape[1], grid.shape[2]
+    ix = (grid[..., 0] + 1.0) * 0.5 * (W - 1)
+    iy = (grid[..., 1] + 1.0) * 0.5 * (H - 1)
+    if padding_mode == "border":
+        ix = ix.clamp(0, W - 1)
+        iy = iy.clamp(0, H - 1)
+    elif padding_mode != "zeros":
+        raise ValueError(f"Unsupported padding_mode {padding_mode!r}")
+    x0 = torch.floor(ix)
+    y0 = torch.floor(iy)
+    wx1 = ix - x0
+    wy1 = iy - y0
+    flat = inp.reshape(N, C, H * W)
+
+    def tap(xc, yc, w):
+        inside = ((xc >= 0) & (xc <= W - 1) & (yc >= 0) & (yc <= H - 1)).to(inp.dtype)
+        idx = (yc.clamp(0, H - 1) * W + xc.clamp(0, W - 1)).long().reshape(N, 1, Ho * Wo).expand(N, C, Ho * Wo)
+        return torch.gather(flat, 2, idx).reshape(N, C, Ho, Wo) * (w * inside).unsqueeze(1)
+
+    return (tap(x0, y0, (1 - wx1) * (1 - wy1)) + tap(x0 + 1, y0, wx1 * (1 - wy1))
+            + tap(x0, y0 + 1, (1 - wx1) * wy1) + tap(x0 + 1, y0 + 1, wx1 * wy1))
+
+
 def sample_mri_on_sheet(mri_t, mri_mask_t, xyz_norm_sheet):
     """Sample the MRI trilinearly on a surface and mask it with the MRI mask.
 
