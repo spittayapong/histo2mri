@@ -761,6 +761,98 @@ def pyramid_refinement(
     return phi, alpha, rf_psi, rf_beta, xyz_norm_final
 
 
+def _xyz_from_G_uv(uv_plane_flat, G, H, W, device):
+    """Return the G-plane voxel positions X0 + u*e1 + v*e2 as a (H, W, 3) tensor."""
+    uv = uv_plane_flat.detach().cpu().numpy().reshape(H, W, 2).astype(np.float32)
+    uu, vv = uv[..., 0], uv[..., 1]
+    X0 = np.asarray(G["X0"], np.float32)
+    e1 = np.asarray(G["e1"], np.float32)
+    e2 = np.asarray(G["e2"], np.float32)
+    xyz_g = X0[None, None, :] + uu[..., None] * e1[None, None, :] + vv[..., None] * e2[None, None, :]
+    return torch.from_numpy(xyz_g).to(device=device, dtype=torch.float32)
+
+
+def _support_conf_from_ctrl_uv(uv_plane_flat, ctrl_uv, H, W, device, sigma_uv=20.0, min_conf=0.25):
+    """Return the (H, W) match-support confidence from the distance to the nearest control (u, v)."""
+    if ctrl_uv is None:
+        return torch.ones((H, W), device=device, dtype=torch.float32)
+    cuv = ctrl_uv.detach().cpu().numpy() if torch.is_tensor(ctrl_uv) else np.asarray(ctrl_uv, np.float32)
+    if cuv.ndim != 2 or cuv.shape[0] == 0 or cuv.shape[1] != 2:
+        return torch.ones((H, W), device=device, dtype=torch.float32)
+
+    uv = uv_plane_flat.detach().cpu().numpy().astype(np.float32)
+    d, _ = cKDTree(cuv.astype(np.float32)).query(uv, k=1)
+    conf = np.exp(-(d * d) / (2.0 * float(sigma_uv) ** 2))
+    conf = np.clip((conf - float(min_conf)) / (1.0 - float(min_conf) + 1e-8), 0.0, 1.0)
+    conf = conf ** 2
+    conf[d > 2.0 * float(sigma_uv)] = 0.0
+    return torch.from_numpy(conf.reshape(H, W)).to(device=device, dtype=torch.float32)
+
+
+def tps_sheet_xyz_norm(init_tps, G, uv_plane_flat, H, W, Xdim, Ydim, Zdim, device,
+                       ctrl_uv=None, sigma_uv=20.0, min_conf=0.25, max_disp_vox=16.0):
+    """Return the TPS sheet in normalised xyz, clamped and blended toward the G plane by confidence.
+
+    This is the base sheet of refine_curved_sheet before its B-spline warm start (step 2 of
+    its docstring). init_tps maps (N, 2) plane (u, v) to (N, 3) voxel xyz; its displacement
+    from G is clamped to max_disp_vox voxels and scaled by the support confidence of
+    ctrl_uv. Returns an (H, W, 3) tensor, xyz / (dim - 1) per axis.
+    """
+    with torch.no_grad():
+        xyz_tps = init_tps(uv_plane_flat.detach()).view(H, W, 3)  # voxel xyz
+        xyz_g = _xyz_from_G_uv(uv_plane_flat, G, H, W, device)
+
+        disp = xyz_tps - xyz_g
+        dn = torch.linalg.norm(disp, dim=-1, keepdim=True).clamp_min(1e-6)
+        disp = disp * torch.clamp(float(max_disp_vox) / dn, max=1.0)
+
+        conf = _support_conf_from_ctrl_uv(
+            uv_plane_flat, ctrl_uv, H, W, device,
+            sigma_uv=sigma_uv, min_conf=min_conf
+        )
+        xyz_safe = xyz_g + conf[..., None] * disp
+
+        xyz_norm = torch.stack([
+            xyz_safe[..., 0] / max(Xdim - 1, 1),
+            xyz_safe[..., 1] / max(Ydim - 1, 1),
+            xyz_safe[..., 2] / max(Zdim - 1, 1),
+        ], dim=-1)
+    return xyz_norm
+
+
+def sheet_folding_pct(xyz_norm, valid, dims_xyz, G):
+    """Percentage of folded canvas nodes of a sheet.
+
+    The sheet's tangents (central differences of xyz_norm * (dim - 1), i.e. voxel units) are
+    projected onto G's in-plane basis (e1, e2), giving a signed 2x2 Jacobian determinant per
+    canvas node; the sheet is folded where it is <= 0. Only interior nodes are counted: valid
+    nodes whose four neighbours are valid, excluding the canvas border.
+
+    Args:
+        xyz_norm: tensor or array (H, W, 3), sheet in normalised (x, y, z).
+        valid: bool tensor or array (H, W), nodes to evaluate.
+        dims_xyz: MRI size (X, Y, Z), e.g. slab_Im.GetSize().
+        G: global plane dict; uses "e1" and "e2".
+
+    Returns:
+        Folded share of the interior valid nodes in percent (0.0 if there are none).
+    """
+    P = xyz_norm.detach().cpu().numpy() if torch.is_tensor(xyz_norm) else np.asarray(xyz_norm)
+    P = P.astype(np.float64) * (np.asarray(dims_xyz, np.float64) - 1.0)
+    e1 = np.asarray(G["e1"], np.float64)
+    e2 = np.asarray(G["e2"], np.float64)
+    e1, e2 = e1 / np.linalg.norm(e1), e2 / np.linalg.norm(e2)
+    Pv, Pu = np.gradient(P, axis=0), np.gradient(P, axis=1)
+    det = (Pu @ e1) * (Pv @ e2) - (Pu @ e2) * (Pv @ e1)
+
+    v = valid.detach().cpu().numpy() if torch.is_tensor(valid) else np.asarray(valid)
+    v = v.astype(bool)
+    inner = v & np.roll(v, 1, 0) & np.roll(v, -1, 0) & np.roll(v, 1, 1) & np.roll(v, -1, 1)
+    inner[[0, -1], :] = False
+    inner[:, [0, -1]] = False
+    return 100.0 * float((det[inner] <= 0).mean()) if inner.any() else 0.0
+
+
 def refine_curved_sheet(
     slab_Im, slab_Mm,
     init_G, init_tps, matches_for_warmstart,
@@ -854,56 +946,6 @@ def refine_curved_sheet(
     """
     logger.debug('-------- Refine curved sheet --------')
 
-    def _xyz_from_G_uv(uv_plane_flat, G, H, W, device):
-        """Return the G-plane voxel positions X0 + u*e1 + v*e2 as a (H, W, 3) tensor."""
-        uv = uv_plane_flat.detach().cpu().numpy().reshape(H, W, 2).astype(np.float32)
-        uu, vv = uv[..., 0], uv[..., 1]
-        X0 = np.asarray(G["X0"], np.float32)
-        e1 = np.asarray(G["e1"], np.float32)
-        e2 = np.asarray(G["e2"], np.float32)
-        xyz_g = X0[None, None, :] + uu[..., None] * e1[None, None, :] + vv[..., None] * e2[None, None, :]
-        return torch.from_numpy(xyz_g).to(device=device, dtype=torch.float32)
-
-    def _support_conf_from_ctrl_uv(uv_plane_flat, ctrl_uv, H, W, device, sigma_uv=20.0, min_conf=0.25):
-        """Return the (H, W) match-support confidence from the distance to the nearest control (u, v)."""
-        if ctrl_uv is None:
-            return torch.ones((H, W), device=device, dtype=torch.float32)
-        cuv = ctrl_uv.detach().cpu().numpy() if torch.is_tensor(ctrl_uv) else np.asarray(ctrl_uv, np.float32)
-        if cuv.ndim != 2 or cuv.shape[0] == 0 or cuv.shape[1] != 2:
-            return torch.ones((H, W), device=device, dtype=torch.float32)
-
-        uv = uv_plane_flat.detach().cpu().numpy().astype(np.float32)
-        d, _ = cKDTree(cuv.astype(np.float32)).query(uv, k=1)
-        conf = np.exp(-(d * d) / (2.0 * float(sigma_uv) ** 2))
-        conf = np.clip((conf - float(min_conf)) / (1.0 - float(min_conf) + 1e-8), 0.0, 1.0)
-        conf = conf ** 2
-        conf[d > 2.0 * float(sigma_uv)] = 0.0
-        return torch.from_numpy(conf.reshape(H, W)).to(device=device, dtype=torch.float32)
-
-    def _build_xyz_norm_tps_safe(init_tps, G, uv_plane_flat, H, W, Xdim, Ydim, Zdim, device,
-                                 ctrl_uv=None, sigma_uv=20.0, min_conf=0.25, max_disp_vox=16.0):
-        """Return the TPS sheet in normalised xyz, clamped and blended toward the G plane by confidence."""
-        with torch.no_grad():
-            xyz_tps = init_tps(uv_plane_flat.detach()).view(H, W, 3)  # voxel xyz
-            xyz_g = _xyz_from_G_uv(uv_plane_flat, G, H, W, device)
-
-            disp = xyz_tps - xyz_g
-            dn = torch.linalg.norm(disp, dim=-1, keepdim=True).clamp_min(1e-6)
-            disp = disp * torch.clamp(float(max_disp_vox) / dn, max=1.0)
-
-            conf = _support_conf_from_ctrl_uv(
-                uv_plane_flat, ctrl_uv, H, W, device,
-                sigma_uv=sigma_uv, min_conf=min_conf
-            )
-            xyz_safe = xyz_g + conf[..., None] * disp
-
-            xyz_norm = torch.stack([
-                xyz_safe[..., 0] / max(Xdim - 1, 1),
-                xyz_safe[..., 1] / max(Ydim - 1, 1),
-                xyz_safe[..., 2] / max(Zdim - 1, 1),
-            ], dim=-1)
-        return xyz_norm
-
     mri_t = _prepare_data_tensor(slab_Im, device)
     mri_mask_t = _prepare_data_tensor(slab_Mm, device)
     Zdim, Ydim, Xdim = mri_t.shape[-3:]
@@ -972,7 +1014,7 @@ def refine_curved_sheet(
         )
 
         with torch.no_grad():
-            xyz_norm_tps = _build_xyz_norm_tps_safe(
+            xyz_norm_tps = tps_sheet_xyz_norm(
                 init_tps=init_tps,
                 G=init_G,
                 uv_plane_flat=uv_plane_flat_init,

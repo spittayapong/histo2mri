@@ -724,6 +724,35 @@ class ResidualToGSurface3D(torch.nn.Module):
         return torch.from_numpy(xyz).to(device=uv_query.device, dtype=torch.float32)
 
 
+class InplaneScaledResidual(torch.nn.Module):
+    """Residual TPS with its in-plane component scaled down: d_n + scale * (d - d_n).
+
+    d is the 3D residual from ``fit_residual_tps3d`` and d_n its component along G's normal.
+    The normal part bends the sheet out of the plane and is kept in full; the in-plane part
+    slides the sheet within the plane, and where neighbouring matches disagree it can fold
+    the sheet. Used by the pipeline's fold fix (see pipeline.FOLD_FIX_INPLANE_SCALES).
+
+    Args:
+        residual_tps: callable (M, 2) tensor -> (M, 3) residual.
+        normal: G's plane normal, G["n"].
+        scale: factor on the in-plane component (1 = unchanged, 0 = normal part only).
+
+    ``forward(uv_query)`` takes an (M, 2) tensor of (u, v) and returns the (M, 3) residual.
+    """
+    def __init__(self, residual_tps, normal, scale):
+        super().__init__()
+        self.residual_tps = residual_tps
+        n = np.asarray(normal, np.float32)
+        self.register_buffer("n", torch.as_tensor(n / np.linalg.norm(n)))
+        self.scale = float(scale)
+
+    def forward(self, uv_query):
+        d = self.residual_tps(uv_query)
+        n = self.n.to(device=d.device, dtype=d.dtype)
+        d_n = (d @ n)[:, None] * n[None, :]
+        return d_n + self.scale * (d - d_n)
+
+
 def build_G_anchors_uv_xyz(
     uv_ctrl,                 # [N,2] uv used by TPS fit
     G,

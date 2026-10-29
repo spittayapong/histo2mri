@@ -22,8 +22,9 @@ from .outliers import filter_outliers
 from .plane import fit_global_plane, matches_to_common_canvas
 from .preprocessing import prepare_histology, prepare_mri_slab, resample_histo_to_mri
 from .qc import plot_mri_on_histology_rgb, plot_mri_on_sheet, plot_roi_support, show_matched_pairs, visualize_roi_from_matches
-from .refine import refine_curved_sheet
-from .tps import ResidualToGSurface3D, fit_residual_tps2d, fit_residual_tps3d, fit_tps_robust, resample_histology_on_surface
+from .refine import prepare_coords_from_G_canvas, refine_curved_sheet, sheet_folding_pct, tps_sheet_xyz_norm
+from .tps import (InplaneScaledResidual, ResidualToGSurface3D, fit_residual_tps2d, fit_residual_tps3d,
+                  fit_tps_robust, resample_histology_on_surface)
 
 
 # Named settings for stains/regions that need different parameters. "default" is used for
@@ -64,6 +65,13 @@ MATCHER_SETTINGS = dict(
     mind_radius=2, mind_dilation=1,
     hist_batch=128, mri_chunk=16384, keep_mri_bank_on_gpu=True,
 )
+
+# Fold fix. Where neighbouring matches disagree, the in-plane part of the 3D residual TPS can
+# fold the initial sheet, and the refinement keeps such folds (they show as swirls in the MRI
+# on the histology). If the initial sheet folds, the in-plane part is scaled by these factors
+# in turn until it no longer does; that sheet is refined as well and the result whose final
+# sheet folds less is kept. Sections whose initial sheet does not fold are not affected.
+FOLD_FIX_INPLANE_SCALES = (0.5, 0.25)
 
 logger = logging.getLogger(__name__)
 
@@ -113,8 +121,10 @@ def register_section(subject_id, num_str, histo_type, spacing, orientation, flip
     threshold from a MAD fit, then a MAD refit), drop matches far in-plane from G, and fit
     3D and 2D residual TPS on top of G; resample the histology onto the canvas through G and
     the 2D residual; refine the curved sheet in the MRI so that the MRI sampled on it
-    matches that histology; pull the MRI back to the HR histology for QC; and save the
-    transform. Errors are not caught here; they propagate to the caller.
+    matches that histology (if the initial sheet folds, also refine one with the in-plane
+    residual scaled down and keep the less folded result; see FOLD_FIX_INPLANE_SCALES);
+    pull the MRI back to the HR histology for QC; and save the transform. Errors are not
+    caught here; they propagate to the caller.
 
     Args:
         subject_id: Subject folder name under data_root; also the file-name prefix.
@@ -442,20 +452,60 @@ def _register(subject_id, num_str, histo_type, spacing, orientation, flip, data_
     hist_mask_on_init_tps = (hist_mask_on_init_tps > 0.5)
     logger.info("Initial TPS on top of G fitted")
 
+    # ---- Fold check of the initial sheet (see FOLD_FIX_INPLANE_SCALES) ----
+    # The sheet the refinement starts from (tps_sheet_xyz_norm, before its B-spline warm
+    # start), evaluated on the canvas nodes that lie inside the MRI and the histology mask.
+    dims_xyz = slab_Im.GetSize()
+    uv_canvas, _, _ = prepare_coords_from_G_canvas(G, Hc, Wc, device,
+                                                   common_shift_yx=G.get("canvas_offset_yx", None))
+
+    def _initial_folding(residual):
+        sheet = ResidualToGSurface3D(G=G, residual_tps=residual, device=device).to(device)
+        xyz = tps_sheet_xyz_norm(sheet, G, uv_canvas, Hc, Wc, *dims_xyz, device, ctrl_uv=uv_in2,
+                                 sigma_uv=20.0, min_conf=0.25, max_disp_vox=clamp_vox)
+        inside = _to_np(((xyz >= 0) & (xyz <= 1)).all(dim=-1))
+        return sheet_folding_pct(xyz, inside & valid_hist & hist_mask_on_init_tps, dims_xyz, G)
+
+    fold_initial = _initial_folding(tps3d_res)
+    tps3d_res_shrunk = None
+    if fold_initial > 0.0:
+        for inplane_scale in FOLD_FIX_INPLANE_SCALES:
+            tps3d_res_shrunk = InplaneScaledResidual(tps3d_res, G["n"], inplane_scale)
+            fold_shrunk = _initial_folding(tps3d_res_shrunk)
+            if fold_shrunk <= 0.0:
+                break
+        logger.info(f"Fold fix - initial sheet folds on {fold_initial:.3f}% of the canvas; "
+                    f"in-plane residual x{inplane_scale:g}: {fold_shrunk:.3f}%")
+
     # ---- Curved-sheet refinement ----
     # Initial surface = G + 3D residual TPS (absolute MRI voxel xyz). The refinement deforms the
     # sheet so that the MRI sampled on it matches hist_on_init_tps.
-    init_tps_abs = ResidualToGSurface3D(G=G, residual_tps=tps3d_res, device=device).to(device)
+    def _refine(residual):
+        init_tps_abs = ResidualToGSurface3D(G=G, residual_tps=residual, device=device).to(device)
+        refined = refine_curved_sheet(
+            slab_Im=slab_Im, slab_Mm=slab_Mm, init_G=G, init_tps=init_tps_abs,
+            matches_for_warmstart=matches_inliers_final, device=device,
+            hist_on_init_tps=hist_on_init_tps, hist_mask_on_init_tps=None,
+            ctrl_uv_support=uv_in2, tps_sigma_uv=20.0, tps_min_conf=0.25, tps_max_disp_vox=clamp_vox,
+            lam_area=lam_area, lam_shape=lam_shape, w_rigid_mode=w_rigid_mode,
+            similarity_weights=settings["refine_similarity_weights"],
+            gif_file=None,
+        )
+        valid = refined[2] & valid_hist & hist_mask_on_init_tps
+        return init_tps_abs, refined, sheet_folding_pct(refined[0], valid, dims_xyz, G)
+
+    init_tps_abs, refined, fold_final = _refine(tps3d_res)
+    if tps3d_res_shrunk is not None:
+        result_shrunk = _refine(tps3d_res_shrunk)
+        use_shrunk = result_shrunk[2] < fold_final
+        logger.info(f"Fold fix - final sheet folding: original {fold_final:.3f}%, in-plane residual "
+                    f"x{inplane_scale:g} {result_shrunk[2]:.3f}% -> "
+                    f"{'using the scaled residual' if use_shrunk else 'keeping the original'}")
+        if use_shrunk:
+            init_tps_abs, refined, fold_final = result_shrunk
+        del result_shrunk
     (xyz_norm_final, mri_on_final_sheet, valid_mri,
-     _xyz_norm_base, _conf, _phi, _n0, _alpha, _rf_psi, _rf_beta) = refine_curved_sheet(
-        slab_Im=slab_Im, slab_Mm=slab_Mm, init_G=G, init_tps=init_tps_abs,
-        matches_for_warmstart=matches_inliers_final, device=device,
-        hist_on_init_tps=hist_on_init_tps, hist_mask_on_init_tps=None,
-        ctrl_uv_support=uv_in2, tps_sigma_uv=20.0, tps_min_conf=0.25, tps_max_disp_vox=clamp_vox,
-        lam_area=lam_area, lam_shape=lam_shape, w_rigid_mode=w_rigid_mode,
-        similarity_weights=settings["refine_similarity_weights"],
-        gif_file=None,
-    )
+     _xyz_norm_base, _conf, _phi, _n0, _alpha, _rf_psi, _rf_beta) = refined
     logger.info("Refined curved sheet")
 
     # ---- QC figures in MRI (sheet) space ----
@@ -511,8 +561,8 @@ def _register(subject_id, num_str, histo_type, spacing, orientation, flip, data_
     logger.info(f"Saved transform grid -> {save_path}")
 
     # Free large objects and cached GPU memory before the next section.
-    del all_matches, clean_matches, coarse_matches, matches_inliers, matches_inliers_final
-    del tps_ransac, tps_init_final, tps3d_res, tps2d_res, init_tps_abs
+    del all_matches, clean_matches, coarse_matches, matches_inliers
+    del tps_ransac, tps_init_final, tps3d_res, tps3d_res_shrunk, tps2d_res, init_tps_abs, refined
     torch.cuda.empty_cache()
 
     elapsed_sec = time.perf_counter() - section_start
