@@ -42,8 +42,10 @@ logger = logging.getLogger(__name__)
 def make_A_proc_to_scaled(proc_Ih, scaled_proc_Ih):
     """Build the proc -> scaled histology index affine.
 
-    The x and y scales are the ratios of image sizes (scaled / proc), so the
-    affine is a pure diagonal scaling about pixel index 0 with no translation.
+    The x and y scales are the ratios of image sizes (scaled / proc).
+    rescale_histology resizes with align_corners=False, which aligns pixel
+    edges rather than pixel centres, so x_scaled = (x_proc + 0.5) * s - 0.5:
+    a diagonal scaling plus a translation of 0.5 * (s - 1) pixels.
 
     Args:
         proc_Ih: prepared (padded) histology, sitk.Image.
@@ -59,6 +61,8 @@ def make_A_proc_to_scaled(proc_Ih, scaled_proc_Ih):
     A = np.eye(4, dtype=np.float64)
     A[0, 0] = sx
     A[1, 1] = sy
+    A[0, 3] = 0.5 * (sx - 1.0)
+    A[1, 3] = 0.5 * (sy - 1.0)
     return A
 
 
