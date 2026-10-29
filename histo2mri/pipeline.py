@@ -54,8 +54,7 @@ PROFILES = {
 }
 
 # Patch-matcher settings shared by search_scale, search_patch_config and match_patches.
-# match_patches also fuses an NGF term with its default weight w_ngf=0.2 (not set here, because
-# the cached matcher used by search_scale has no NGF term).
+# Fine matching (match_patches) adds an NGF term on top, see FINE_MATCH_W_NGF.
 MATCHER_SETTINGS = dict(
     cell_size=8, bins=18,                 # HOG cell size (px) and orientation bins
     min_histo_mask_frac=0.2,              # keep histology patches with >= 20% tissue
@@ -65,6 +64,12 @@ MATCHER_SETTINGS = dict(
     mind_radius=2, mind_dilation=1,
     hist_batch=128, mri_chunk=16384, keep_mri_bank_on_gpu=True,
 )
+
+# NGF fusion weight of the fine matcher only, so its score is
+# (0.6*HOG + 0.4*MIND + 0.2*NGF) / 1.2. Not part of MATCHER_SETTINGS, because the cached
+# HOG+MIND matcher used by the scale and patch-config searches has no NGF term. Without NGF,
+# mean TRE on 37 myelin sections got worse (1.91 -> 1.99 mm) and the surface folded more.
+FINE_MATCH_W_NGF = 0.2
 
 # Fold fix. Where neighbouring matches disagree, the in-plane part of the 3D residual TPS can
 # fold the initial sheet, and the refinement keeps such folds (they show as swirls in the MRI
@@ -301,6 +306,7 @@ def _register(subject_id, num_str, histo_type, spacing, orientation, flip, data_
         z_min=z_min, z_max=z_max,
         hist_patch=best_patch, hist_stride=best_hist_stride,
         mri_patch=best_patch, mri_stride=best_mri_stride,
+        w_ngf=FINE_MATCH_W_NGF,
         **matcher,
     )
 
