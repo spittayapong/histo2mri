@@ -1541,7 +1541,9 @@ def evaluate_fixed_scale_multi_patch(
 
     results = sorted(results, key=lambda r: r["robust_score"], reverse=True)
 
-    logger.info('Best config: %s', {k: results[0][k] for k in ['patch', 'hist_stride', 'mri_stride', 'robust_score', 'n_matches']})
+    # Highest robust_score only; search_patch_config chooses by RANSAC consistency instead
+    # (logged as "Chosen patch config").
+    logger.info('Highest robust score: %s', {k: results[0][k] for k in ['patch', 'hist_stride', 'mri_stride', 'robust_score', 'n_matches']})
     return results
 
 
