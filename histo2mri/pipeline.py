@@ -33,7 +33,7 @@ from .tps import (InplaneScaledResidual, ResidualToGSurface3D, fit_residual_tps2
 #   outlier_plane_dist: distance threshold (MRI voxels) of the coarse RANSAC plane pre-filter
 #     in filter_outliers.
 #   outlier_knn: parameters of the stricter kNN outlier filter that follows it.
-#   refine_similarity_weights: (w_ssim, w_ngf, w_mind) similarity weights used by
+#   refine_similarity_weights: (w_ssim, w_mind) weights of the SSIM and MIND image loss in
 #     refine_curved_sheet.
 # Profiles other than "default":
 #   he-cblock: H&E sections of the cerebellum blocks. The internal granular layer is the
@@ -44,12 +44,12 @@ PROFILES = {
     "default": dict(
         outlier_plane_dist=20.0,
         outlier_knn=dict(k=8, plane_mad_k=3.0, tukey_k=3.0, cc_radius_scale=3.0),
-        refine_similarity_weights=(1.0, 0.0, 0.0),   # (w_ssim, w_ngf, w_mind)
+        refine_similarity_weights=(1.0, 0.0),   # (w_ssim, w_mind)
     ),
     "he-cblock": dict(
         outlier_plane_dist=20.0,
         outlier_knn=dict(k=3, plane_mad_k=2.0, tukey_k=1.5, cc_radius_scale=2.0),
-        refine_similarity_weights=(0.0, 0.0, 1.0),
+        refine_similarity_weights=(0.0, 1.0),
     ),
 }
 

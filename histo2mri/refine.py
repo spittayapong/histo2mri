@@ -81,7 +81,7 @@ import imageio.v2 as imageio
 import torch
 import torch.nn.functional as F
 from .bspline import BSplineFFD2D, BSplineResidualSurface3D, ScalarNormalOffsetField, _copy_ctrl, _upsample_ctrl, bending_energy, sheet_inside_volume_penalty
-from .losses import _build_rigidity_weight, combined_masked_ssim_mind_loss, combined_masked_ssim_ngf_loss, first_fundamental_form, surface_area_ratio
+from .losses import _build_rigidity_weight, combined_masked_ssim_mind_loss, first_fundamental_form, surface_area_ratio
 from .qc import _plot_surface
 from .sampling import grid_sample_2d_det, _prepare_data_tensor, sample_mri_cubic_3d, sample_mri_on_sheet
 import logging
@@ -374,7 +374,7 @@ def pyramid_refinement(
     lam_shape=0.0,          # orthonormality: weight on ||[[E,F],[F,G]] - base||^2 (OFF by default)
     w_rigid_mode="mask",    # "mask" | "conf" | "edge" | "none"
     rigid_edge_k=2.0,       # only used by w_rigid_mode="edge"
-    similarity_weights=(1.0, 0.0, 0.0),   # (w_ssim, w_ngf, w_mind) of the image loss
+    similarity_weights=(1.0, 0.0),   # (w_ssim, w_mind) of the image loss
 ):
     """Refine the base sheet with four B-spline fields over a coarse-to-fine pyramid.
 
@@ -439,10 +439,9 @@ def pyramid_refinement(
         w_rigid_mode: per-pixel rigidity weight, "mask", "conf", "edge" or "none"
             (see losses._build_rigidity_weight).
         rigid_edge_k: edge gain for w_rigid_mode="edge".
-        similarity_weights: (w_ssim, w_ngf, w_mind). The image loss is always
-            losses.combined_masked_ssim_mind_loss (similarity_metric is fixed to "mind"
-            in the code), so w_ngf has no effect. The parameter profiles use (1, 0, 0)
-            (SSIM only) and (0, 0, 1) (MIND only).
+        similarity_weights: (w_ssim, w_mind) of the image loss
+            losses.combined_masked_ssim_mind_loss. The parameter profiles use (1, 0)
+            (SSIM only) and (0, 1) (MIND only).
 
     Returns:
         Tuple (phi, alpha, rf_psi, rf_beta, xyz_norm_final):
@@ -453,8 +452,7 @@ def pyramid_refinement(
             xyz_norm_final: tensor (H, W, 3), refined sheet in normalised (x, y, z),
                 computed without gradient.
     """
-    similarity_metric = "mind"   # "ngf" or "mind": selects the image loss
-    w_ssim, w_ngf, w_mind = similarity_weights
+    w_ssim, w_mind = similarity_weights
     hist_mask_fixed = (hist_mask_t > 0.5).float().detach()
     mask_soft = make_soft_dilated_mask(hist_mask_fixed, dilate_px=8, blur_ks=11, blur_passes=1).detach()
 
@@ -569,10 +567,7 @@ def pyramid_refinement(
                 frame_cb(xyz_norm)
 
             mri2d = sample_mri_on_sheet(mri_t, mri_mask_t, xyz_norm)
-            if similarity_metric == "mind":
-                loss_img, comp = combined_masked_ssim_mind_loss(mri2d, hist_t, mask_soft, w_ssim=w_ssim, w_mind=w_mind)
-            else:
-                loss_img, comp = combined_masked_ssim_ngf_loss(mri2d, hist_t, mask_soft, w_ssim=w_ssim, w_ngf=w_ngf)
+            loss_img, comp = combined_masked_ssim_mind_loss(mri2d, hist_t, mask_soft, w_ssim=w_ssim, w_mind=w_mind)
             L_reg_terms, loss_extra = reg_fn(xyz_norm, out_val)
             loss = loss_img + loss_extra
 
@@ -581,8 +576,7 @@ def pyramid_refinement(
             opt.step()
 
             if it % 50 == 0 or it == n_iter - 1:
-                metric_name = "ngf" if "ngf" in comp else "mind"
-                logger.debug(f"[{name}] it={it:04d}/{n_iter} loss={loss.item():.6f} img={loss_img.item():.6f} {print_extra_fn(L_reg_terms)} ssim={comp['ssim']:.4f} {metric_name}={comp[metric_name]:.4f}")
+                logger.debug(f"[{name}] it={it:04d}/{n_iter} loss={loss.item():.6f} img={loss_img.item():.6f} {print_extra_fn(L_reg_terms)} ssim={comp['ssim']:.4f} mind={comp['mind']:.4f}")
 
             if loss.item() < best_loss:
                 best_loss, no_improve = loss.item(), 0
@@ -873,7 +867,7 @@ def refine_curved_sheet(
     w_rigid_mode="mask",
     rigid_edge_k=2.0,
     lam_rigid_levels=(1.0, 1.0, 1.0),   # per-pyramid-level multiplier on the rigidity loss
-    similarity_weights=(1.0, 0.0, 0.0),  # (w_ssim, w_ngf, w_mind), passed to pyramid_refinement
+    similarity_weights=(1.0, 0.0),  # (w_ssim, w_mind), passed to pyramid_refinement
 ):
     """Refine the histology sheet inside the MRI slab by image similarity.
 
@@ -926,7 +920,7 @@ def refine_curved_sheet(
         rigid_edge_k: edge gain for w_rigid_mode="edge".
         lam_rigid_levels: multipliers on the rigidity loss for the three pyramid
             levels; if shorter than 3, the last value is repeated.
-        similarity_weights: (w_ssim, w_ngf, w_mind) for the image loss; see
+        similarity_weights: (w_ssim, w_mind) for the image loss; see
             pyramid_refinement.
 
     Returns:

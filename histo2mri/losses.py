@@ -20,76 +20,11 @@ def _gaussian_kernel(win, sigma, device, dtype):
     return k
 
 
-def _sobel_kernels(device, dtype):
-    """Return the 3x3 Sobel kernels (sx, sy), each shaped (1, 1, 3, 3)."""
-    sx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=device, dtype=dtype).view(1, 1, 3, 3)
-    sy = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=device, dtype=dtype).view(1, 1, 3, 3)
-    return sx, sy
-
-
 def _norm01_t(x):
     """Min-max normalise x to [0, 1] over its last two (H, W) axes, per sample and channel."""
     return (x - x.amin(dim=(-2, -1), keepdim=True)) / (
         x.amax(dim=(-2, -1), keepdim=True) - x.amin(dim=(-2, -1), keepdim=True) + 1e-8
     )
-
-
-def combined_masked_ssim_ngf_loss(warped, hist, mask, w_ssim=0.5, w_ngf=0.5, win=11, sigma=1.5, eps=1e-8):
-    """Compute a weighted SSIM + NGF dissimilarity, averaged over mask pixels.
-
-    Both images are min-max normalised to [0, 1]. SSIM is computed on the full,
-    unmasked images with a Gaussian window (constants C1 = 0.01^2, C2 = 0.03^2) and
-    only the final average is restricted to the mask, so background pixels where both
-    images are zero do not inflate the score. The gradient term uses Sobel gradients
-    and penalises 1 - (grad w . grad h)^2 / (|grad w| |grad h|), averaged over the
-    same mask.
-
-    Args:
-        warped: MRI sampled on the sheet, tensor (N, 1, H, W).
-        hist: histology on the common canvas, tensor (N, 1, H, W).
-        mask: tensor broadcastable to (N, 1, H, W); pixels with mask > 0.1 count.
-        w_ssim: weight of the SSIM term.
-        w_ngf: weight of the gradient term.
-        win: SSIM window size in pixels.
-        sigma: standard deviation of the SSIM Gaussian window, in pixels.
-        eps: small constant for numerical stability.
-
-    Returns:
-        Tuple (loss, parts): loss is the scalar tensor
-        w_ssim * (1 - masked mean SSIM) + w_ngf * masked mean gradient term;
-        parts is a dict {"ssim": float, "ngf": float} with the two unweighted terms.
-    """
-    m = (mask > 0.1).float()
-    w = _norm01_t(warped)
-    h = _norm01_t(hist)
-
-    N, C, H, W = w.shape
-    k = _gaussian_kernel(win, sigma, w.device, w.dtype).repeat(C, 1, 1, 1)
-
-    mu1 = F.conv2d(w, k, padding=win // 2, groups=C)
-    mu2 = F.conv2d(h, k, padding=win // 2, groups=C)
-    mu1_sq, mu2_sq, mu1_mu2 = mu1 * mu1, mu2 * mu2, mu1 * mu2
-    sigma1_sq = F.conv2d(w * w, k, padding=win // 2, groups=C) - mu1_sq
-    sigma2_sq = F.conv2d(h * h, k, padding=win // 2, groups=C) - mu2_sq
-    sigma12 = F.conv2d(w * h, k, padding=win // 2, groups=C) - mu1_mu2
-
-    C1, C2 = 0.01 ** 2, 0.03 ** 2
-    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
-        (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2) + eps
-    )
-    L_ssim = 1.0 - (ssim_map * m).sum() / (m.sum() + eps)
-
-    sx, sy = _sobel_kernels(w.device, w.dtype)
-    wgx = F.conv2d(w, sx, padding=1); wgy = F.conv2d(w, sy, padding=1)
-    hgx = F.conv2d(h, sx, padding=1); hgy = F.conv2d(h, sy, padding=1)
-    dot = wgx * hgx + wgy * hgy
-    n1 = torch.sqrt(wgx * wgx + wgy * wgy + eps)
-    n2 = torch.sqrt(hgx * hgx + hgy * hgy + eps)
-    ngf2 = (dot * dot) / (n1 * n2 + eps)
-    L_ngf = ((1.0 - ngf2) * m).sum() / (m.sum() + eps)
-
-    loss = w_ssim * L_ssim + w_ngf * L_ngf
-    return loss, {"ssim": float(L_ssim.detach().cpu()), "ngf": float(L_ngf.detach().cpu())}
 
 
 # ------------------------------------------------------------
@@ -184,9 +119,12 @@ def combined_masked_ssim_mind_loss(warped, hist, mask, w_ssim=0.9, w_mind=0.1,
                                     win=11, sigma=1.5, eps=1e-8):
     """Compute a weighted SSIM + MIND dissimilarity, averaged over mask pixels.
 
-    The SSIM term is identical to the one in combined_masked_ssim_ngf_loss. The MIND
-    term is masked_mind_loss on the min-max normalised images, with the binarised
-    mask (mask > 0.1) as weight.
+    Both images are min-max normalised to [0, 1]. SSIM is computed on the full,
+    unmasked images with a Gaussian window (constants C1 = 0.01^2, C2 = 0.03^2) and
+    only the final average is restricted to the mask, so background pixels where both
+    images are zero do not inflate the score. The MIND term is masked_mind_loss on the
+    normalised images, with the binarised mask (mask > 0.1) as weight. The parameter
+    profiles use SSIM only (w_mind = 0) or MIND only (w_ssim = 0).
 
     Args:
         warped: MRI sampled on the sheet, tensor (N, 1, H, W).
