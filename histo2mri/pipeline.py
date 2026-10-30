@@ -295,6 +295,13 @@ def _register(subject_id, num_str, histo_type, spacing, orientation, flip, data_
     scaled_proc_Ih, scaled_proc_Mh = rescale_histology(proc_Ih, proc_Mh, best_scale)
 
     # The z band returned by search_patch_config is replaced by a fixed +/-60-slice window.
+    # The band only reflects the spread of a few coarse matches (often its 8-slice minimum),
+    # while the section's own tilt makes the final sheet reach well beyond it. The window is a
+    # tilt allowance: at the 0.375-0.4 mm MRI it was set for, 60 slices are about +/-23 mm,
+    # which covers about 26 deg of tilt for a typical section (16 deg for the largest ones).
+    # It is a slice count, not a distance, so it does not carry over to coarser MRI (at 1 mm,
+    # 60 slices are +/-60 mm). A window in mm, converted with the slice spacing or estimated
+    # from the section size and its tilt, would be the general solution.
     size = slab_Im.GetSize()
     Z = int(size[2]) if slab_Im.GetDimension() == 3 else 1
     z_min = max(0, int(z_center - 60))
