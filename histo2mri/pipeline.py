@@ -71,6 +71,14 @@ MATCHER_SETTINGS = dict(
 # mean TRE on 37 myelin sections got worse (1.91 -> 1.99 mm) and the surface folded more.
 FINE_MATCH_W_NGF = 0.2
 
+# Half-width of the fine-matching z window around z_center, in mm; converted to slices with
+# the slab's slice spacing. It is a tilt allowance: about 26 deg of section tilt for a typical
+# section, 16 deg for the largest ones. The coarse z band of search_patch_config is not used,
+# because it only reflects the spread of a few coarse matches (often its 8-slice minimum),
+# while the section's tilt makes the final sheet reach well beyond it. 24 mm equals the former
+# fixed 60 slices at 0.4 mm MRI and gives 64 slices at 0.375 mm.
+FINE_MATCH_Z_HALF_MM = 24.0
+
 # Fold fix. Where neighbouring matches disagree, the in-plane part of the 3D residual TPS can
 # fold the initial sheet, and the refinement keeps such folds (they show as swirls in the MRI
 # on the histology). If the initial sheet folds, the in-plane part is scaled by these factors
@@ -291,21 +299,16 @@ def _register(subject_id, num_str, histo_type, spacing, orientation, flip, data_
     logger.info(f"Best patch:{best_patch} hist_stride:{best_hist_stride} mri_stride:{best_mri_stride} "
                  f"z_center:{z_center}")
 
-    # ---- Fine matching (proc -> scaled histology), restricted to z_center +/- 60 slices ----
+    # ---- Fine matching (proc -> scaled histology), restricted to z_center +/- FINE_MATCH_Z_HALF_MM ----
     scaled_proc_Ih, scaled_proc_Mh = rescale_histology(proc_Ih, proc_Mh, best_scale)
 
-    # The z band returned by search_patch_config is replaced by a fixed +/-60-slice window.
-    # The band only reflects the spread of a few coarse matches (often its 8-slice minimum),
-    # while the section's own tilt makes the final sheet reach well beyond it. The window is a
-    # tilt allowance: at the 0.375-0.4 mm MRI it was set for, 60 slices are about +/-23 mm,
-    # which covers about 26 deg of tilt for a typical section (16 deg for the largest ones).
-    # It is a slice count, not a distance, so it does not carry over to coarser MRI (at 1 mm,
-    # 60 slices are +/-60 mm). A window in mm, converted with the slice spacing or estimated
-    # from the section size and its tilt, would be the general solution.
+    # The z band returned by search_patch_config is replaced by a fixed window in mm.
     size = slab_Im.GetSize()
     Z = int(size[2]) if slab_Im.GetDimension() == 3 else 1
-    z_min = max(0, int(z_center - 60))
-    z_max = min(Z - 1, int(z_center + 60))
+    z_half = int(round(FINE_MATCH_Z_HALF_MM / slab_Im.GetSpacing()[2])) if Z > 1 else 0
+    z_min = max(0, int(z_center - z_half))
+    z_max = min(Z - 1, int(z_center + z_half))
+    logger.info(f"Fine matching z window: +/-{z_half} slices (+/-{FINE_MATCH_Z_HALF_MM:g} mm)")
 
     all_matches = match_patches(
         proc_Ih=scaled_proc_Ih, histo_mask=scaled_proc_Mh,
