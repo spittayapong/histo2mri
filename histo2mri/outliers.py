@@ -260,6 +260,9 @@ def knn_outlier_mask_plane_xy_iqr(
 
     q1, q3 = np.percentile(r_plane, [25, 75])
     iqr = max(q3 - q1, 1e-8)
+    # The lower fence drops matches much closer to their neighbours than the patch grid
+    # spacing (several patches collapsing onto one MRI spot). In practice it rarely fires:
+    # 2 of ~1,500 matches on 37 test sections, both on sections with only 5-6 matches.
     lo = max(0.0, q1 - tukey_k * iqr)
     hi = q3 + tukey_k * iqr
 
