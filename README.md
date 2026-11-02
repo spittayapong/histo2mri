@@ -5,6 +5,12 @@ sheet in MRI voxel space.
 
 <!-- Installation, usage, demo and citation will be added before the release. -->
 
+## Requirements
+
+A CUDA GPU and enough RAM: about 35 GB per section for 0.375 mm MRI slabs of about
+410 × 440 × 370 voxels (peak in the coarse search), and about 50 GB for 4 µm NextBrain
+histology (peak when writing the full-resolution outputs).
+
 ## Limitations
 
 - **Very small sections.** Patch matching runs at MRI resolution with 64–96 px patches, so a
