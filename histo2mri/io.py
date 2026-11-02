@@ -125,8 +125,9 @@ def load_volume_auto(base_path_no_ext, npz_key, spacing, pixel_type=None):
 def load_section(subject_id, num_str, histo_type, spacing, orientation, flip, data_root):
     """Load the HR histology, its mask, the optional RGB histology, the MRI and the MRI mask.
 
-    Expected layout (each file as .mnc, or as .npz with the array under the given key; .mnc
-    is used when both exist):
+    Expected layout (histology files as .mnc, or as .npz with the array under the given key;
+    .mnc is used when both exist. The MRI and its mask must be .mnc, because their spacing
+    comes from the header):
 
         data_root/<subject_id>/histo_<histo_type>/gray/<subject_id>_<num_str>_gray     key "gray"
         data_root/<subject_id>/histo_<histo_type>/mask/<subject_id>_<num_str>_bimask   key "bimask"
@@ -134,7 +135,7 @@ def load_section(subject_id, num_str, histo_type, spacing, orientation, flip, da
         data_root/<subject_id>/mri/<subject_id>_T1                                    key "T1"
         data_root/<subject_id>/mri/<subject_id>_bimask                                key "bimask"
 
-    .npz histology arrays are expected as (1, H, W) (RGB: (1, H, W, 3)), MRI arrays as (Z, Y, X). The
+    .npz histology arrays are expected as (1, H, W) (RGB: (1, H, W, 3)). The
     histology gray image and mask, and the MRI, are read as float32; .mnc MRI masks and
     RGB images keep their stored pixel type. The flip is applied to the three histology
     images (about the image centre, so the physical extent is unchanged); the orientation
@@ -144,13 +145,15 @@ def load_section(subject_id, num_str, histo_type, spacing, orientation, flip, da
         subject_id: Subject folder name; also the file-name prefix.
         num_str: Section identifier (see build_num_str).
         histo_type: Histology type, selects histo_<histo_type>.
-        spacing: (x, y, z) spacing given to every image read from .npz (histology and MRI).
+        spacing: (x, y, z) histology spacing, given to histology images read from .npz.
         orientation: Key of ORIENTATION_PERMUTE.
         flip: (flip_x, flip_y, flip_z) booleans (see parse_flip).
         data_root: Root data folder.
     Returns:
         Dict with sitk images "Ih_hr" (HR histology), "Mh_hr" (HR histology mask), "Im"
         (MRI), "Mm" (MRI mask) and "Ih_rgb_hr" (RGB histology, or None if no file exists).
+    Raises:
+        FileNotFoundError: If a required file is missing, or the MRI or its mask is not .mnc.
     """
     histo_dir = os.path.join(data_root, subject_id, f"histo_{histo_type}", "gray")
     histo_mask_dir = os.path.join(data_root, subject_id, f"histo_{histo_type}", "mask")
@@ -178,11 +181,16 @@ def load_section(subject_id, num_str, histo_type, spacing, orientation, flip, da
 
     permute_axes = ORIENTATION_PERMUTE[orientation]
 
+    # The CSV spacing is the histology's, so an .npz MRI would silently get it too: require MINC.
     mri_base = os.path.join(mri_dir, f"{subject_id}_T1")
+    mri_mask_base = os.path.join(mri_dir, f"{subject_id}_bimask")
+    for base in (mri_base, mri_mask_base):
+        if not os.path.exists(base + ".mnc"):
+            raise FileNotFoundError(f"{base}.mnc not found: the MRI and its mask must be MINC files, "
+                                    "whose header gives their spacing (.npz MRI is not supported)")
     Im = load_volume_auto(mri_base, npz_key="T1", spacing=spacing, pixel_type=sitk.sitkFloat32)
     Im = sitk.PermuteAxes(Im, permute_axes)
 
-    mri_mask_base = os.path.join(mri_dir, f"{subject_id}_bimask")
     Mm = load_volume_auto(mri_mask_base, npz_key="bimask", spacing=spacing)
     Mm = sitk.PermuteAxes(Mm, permute_axes)
 

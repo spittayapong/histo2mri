@@ -14,6 +14,13 @@ sheet in MRI voxel space.
   result. If no match is consistent with the fitted plane, the pipeline currently stops with an
   `IndexError` (in `np.percentile`) instead of a clear message. A denser patch grid gives more
   matches but did not improve accuracy in our tests. A proper fix is planned.
+- **Input histology must be pre-smoothed.** The pipeline downsamples the full-resolution
+  histology to MRI voxel size with linear interpolation and no anti-aliasing (a factor of
+  about 75-100 for 4-5 µm histology and 0.4 mm MRI). Smooth the histology to roughly MRI
+  resolution beforehand, as was done for the data we tested; otherwise cell-level texture
+  aliases into noise. Moving this smoothing into the pipeline is planned.
+- **MRI input must be MINC.** The MRI and its mask are read from `.mnc` files, whose header
+  gives their spacing; the `spacing` column of the sections CSV applies to the histology only.
 - **Fine-matching z window.** Fine matching searches ±24 mm (`FINE_MATCH_Z_HALF_MM` in
   `histo2mri/pipeline.py`) around the slice found by the coarse search, which tolerates about
   26° of section tilt for a typical section. The value was set on 0.375–0.4 mm MRI; for strongly
