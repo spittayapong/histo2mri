@@ -226,7 +226,16 @@ documented transform field. It asserts nothing about accuracy.
 
 ## Citation
 
-To be added before the release.
+Cite the software with the metadata in [CITATION.cff](CITATION.cff), which GitHub also
+offers through its "Cite this repository" button:
+
+> Pittayapong, S., Bachratá, B., Erber, I., Endmayr, V., Menard, C., Bogner, W.,
+> Höftberger, R., Hametner, S., & Grabner, G. *Single-Section Histology-MRI Brain
+> Registration: An Automated 2D-to-3D Approach Without Auxiliary Data* (version 0.1.0)
+> [Computer software]. https://github.com/spittayapong/histo2mri
+
+There is no release tag yet, so quote the commit you used — `git rev-parse --short HEAD` —
+alongside the version. A tagged release and the paper reference will be added here.
 
 ## License
 

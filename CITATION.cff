@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "Single-Section Histology-MRI Brain Registration: An Automated 2D-to-3D Approach Without Auxiliary Data"
+abstract: >-
+  histo2mri registers a single 2D histology section to a 3D MRI volume without
+  serial sections, a block-face photograph or any other auxiliary data. Each
+  section is mapped onto a curved sheet in MRI voxel space, so a point on the
+  slide and a point in the volume convert into each other in both directions.
+authors:
+  - given-names: Sutatip
+    family-names: Pittayapong
+  - given-names: Beáta
+    family-names: Bachratá
+  - given-names: Irene
+    family-names: Erber
+  - given-names: Verena
+    family-names: Endmayr
+  - given-names: Christian
+    family-names: Menard
+  - given-names: Wolfgang
+    family-names: Bogner
+  - given-names: Romana
+    family-names: Höftberger
+  - given-names: Simon
+    family-names: Hametner
+  - given-names: Günther
+    family-names: Grabner
+version: 0.1.0
+license: MIT
+repository-code: "https://github.com/spittayapong/histo2mri"
+keywords:
+  - histology
+  - MRI
+  - registration
+  - neuroimaging
+  - BIDS
