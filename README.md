@@ -231,7 +231,7 @@ offers through its "Cite this repository" button:
 
 > Pittayapong, S., Bachratá, B., Erber, I., Endmayr, V., Menard, C., Bogner, W.,
 > Höftberger, R., Hametner, S., & Grabner, G. *Single-Section Histology-MRI Brain
-> Registration: An Automated 2D-to-3D Approach Without Auxiliary Data* (version 0.1.0)
+> Registration: An Automated 2D-to-3D Approach Without Auxiliary Data* (version 0.1.0a1)
 > [Computer software]. https://github.com/spittayapong/histo2mri
 
 Until a stable release, the tags here are pre-releases: quote the one you used, or the
