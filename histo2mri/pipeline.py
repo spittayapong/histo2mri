@@ -16,12 +16,13 @@ import SimpleITK as sitk
 import torch
 from .canvas import create_common_canvas, extract_roi_plane
 from .inverse import build_hr_common_affines, mri_on_histology_space
-from .io import load_section
+from .io import load_section, resolve_section
 from .matching import match_patches, rescale_histology, search_patch_config, search_scale
 from .outliers import filter_outliers
 from .plane import fit_global_plane, matches_to_common_canvas
 from .preprocessing import prepare_histology, prepare_mri_slab, resample_histo_to_mri
-from .qc import plot_mri_on_histology_rgb, plot_mri_on_sheet, plot_roi_support, show_matched_pairs, visualize_roi_from_matches
+from .qc import (plot_histology_in_mri_space, plot_mri_on_histology_rgb, plot_mri_on_sheet, plot_roi_support,
+                 show_matched_pairs, visualize_roi_from_matches)
 from .refine import prepare_coords_from_G_canvas, refine_curved_sheet, sheet_folding_pct, tps_sheet_xyz_norm
 from .tps import (InplaneScaledResidual, ResidualToGSurface3D, fit_residual_tps2d, fit_residual_tps3d,
                   fit_tps_robust, resample_histology_on_surface)
@@ -117,16 +118,16 @@ def _section_log(log_path):
         pkg_logger.setLevel(old_level)
 
 
-def register_section(subject_id, num_str, histo_type, spacing, orientation, flip, data_root,
-                     out_dir, *, profile="default", device=None, ransac_sample_size=5,
-                     patch_size=64, pclip=(1, 99), scale_max=1.30, scale_step=0.05,
+def register_section(bids_root, subject, sample, out_dir, *, stain=None,
+                     profile="default", device=None, ransac_sample_size=5,
+                     pad_multiple=64, pclip=(1, 99), scale_max=1.30, scale_step=0.05,
                      lam_area=2.0, lam_shape=0.0, w_rigid_mode="mask",
                      mri_on_histo_tile_size=348, matcher_settings=None, save_roi_qc=False,
                      verbose=False):
     """Register one histology section to its MRI volume and save the transform.
 
     Steps: load the section (io.load_section); resample the histology to MRI spacing and pad
-    it to a multiple of the patch size; normalise the MRI intensities; search the histology
+    it to a multiple of pad_multiple; normalise the MRI intensities; search the histology
     scale and the patch/stride configuration, then match histology patches to MRI patches
     within +/-60 slices of the estimated z centre; remove outlier matches; sample the MRI on
     a plane through the matches (ROI plane) and place it and the histology on a common
@@ -140,24 +141,20 @@ def register_section(subject_id, num_str, histo_type, spacing, orientation, flip
     caught here; they propagate to the caller.
 
     Args:
-        subject_id: Subject folder name under data_root; also the file-name prefix.
-        num_str: Section identifier used in file names (see io.build_num_str).
-        histo_type: Histology type; selects the folder data_root/<subject_id>/histo_<histo_type>.
-        spacing: (x, y, z) voxel spacing applied to images loaded from .npz files (see
-            io.load_section); .mnc files use their own header spacing.
-        orientation: "axial", "coronal" or "sagittal"; selects the axis permutation applied
-            to the MRI (io.ORIENTATION_PERMUTE).
-        flip: (flip_x, flip_y, flip_z) booleans; axes along which the histology is flipped
-            on load.
-        data_root: Root folder of the data (layout: see io.load_section).
+        bids_root: Root of the BIDS dataset (layout: see io.load_section).
+        subject: Subject label, with or without the "sub-" prefix.
+        sample: Sample label, with or without the "sample-" prefix.
         out_dir: Output folder for this section; created if missing. All files below are
             written here.
+        stain: Stain label; optional when the subject and sample identify one section.
+            The cutting plane, in-plane rotation, flip and pixel size are read from the
+            section's sidecars by io.load_section.
         profile: Key of PROFILES selecting the outlier-filter and refinement settings.
         device: torch device (or string) for matching, TPS fitting and refinement; defaults
             to "cuda:0" when CUDA is available, otherwise "cpu".
         ransac_sample_size: Minimal sample size of the RANSAC TPS fit (the command line
             uses 3 for NextBrain sections and 5 otherwise).
-        patch_size: The prepared histology is padded to a multiple of this (pixels). The
+        pad_multiple: The prepared histology is padded to a multiple of this (pixels). The
             matching patch sizes themselves are searched (96 and 64 px).
         pclip: (low, high) percentiles for the MRI intensity normalisation.
         scale_max: Upper end of the histology scale search (grid 1.00..scale_max).
@@ -175,7 +172,7 @@ def register_section(subject_id, num_str, histo_type, spacing, orientation, flip
             matches, hull support on histology and ROI plane).
         verbose: Log extra detail of the MRI-on-histology step.
 
-    Files written to out_dir (prefix <subject_id>_<num_str>):
+    Files written to out_dir (prefix <sub-X>_<sample-Y>_<stain-Z>):
         _process.log: Log of this section (overwritten on each call).
         _histo_in_mri_space_all.png: Histology resampled onto the canvas, valid region,
             MRI on the final sheet and their checkerboard.
@@ -209,8 +206,29 @@ def register_section(subject_id, num_str, histo_type, spacing, orientation, flip
                 length (e1 = (1, 0, a), e2 = (0, 1, b) for the plane z = a*x + b*y + c).
             mri_spacing: (3,) float64 voxel spacing (x, y, z) of the permuted MRI.
             mri_size: (3,) int64 size (X, Y, Z) of the permuted MRI.
-            subject_id, num_str, profile: 0-d string arrays identifying the run.
-            version: (1,) int32 file-format version (2).
+            subject_id, sample, stain, section_id, profile: 0-d string arrays
+                identifying the run.
+            mri_origin, mri_direction: (3,) and (9,) float64 origin and direction cosines
+                of the permuted MRI. With mri_spacing they map a sheet voxel position to
+                world millimetres, which is what a 3D viewer needs.
+            mri_permute: (3,) int64 ORIENTATION_PERMUTE order that was applied;
+                mri_view_flip: (3,) bool the in-plane axes load_mri then reversed to reach
+                the viewer frame (io.VIEW_AXES); mri_orientation, mri_canonical ("LPS") and
+                mri_source name the cutting plane, the orientation the volume was brought
+                to, and the file it came from. Together they undo load_mri and reach the
+                stored T1w grid.
+            histo_on_surface, mri_on_surface: (Hc, Wc) float32 histology resampled onto the
+                sheet and the MRI sampled on it, on the common canvas. The full-resolution
+                versions are not stored; regenerate them from the affines.
+            A_hr_to_tif: (4, 4) float64 index affine mapping an HR histology pixel of the
+                loaded (rotated and flipped) image back to a pixel of the cleanslide TIFF.
+                Compose with A_common_to_hr to go from the canvas to that file.
+            crop_origin_xy, source_shape_hw: (2,) int64 position of the cleanslide image
+                within the raw _BF.tif and that slide's shape, or -1 when not cropped.
+            histo_source: 0-d string array, the cleanslide TIFF that was read.
+            version: (1,) int32 file-format version (5; version 4 lacked mri_view_flip and
+                its volume was left in the canonical frame, version 3 lacked the frame and
+                surface fields, version 2 named the section with subject_id and num_str).
 
     Returns:
         Dict with output_npz (path of the .npz), n_clean_matches (number of outlier-filtered
@@ -228,20 +246,22 @@ def register_section(subject_id, num_str, histo_type, spacing, orientation, flip
     matcher = dict(MATCHER_SETTINGS if matcher_settings is None else matcher_settings, device=device)
 
     os.makedirs(out_dir, exist_ok=True)
-    log_path = os.path.join(out_dir, f"{subject_id}_{num_str}_process.log")
+    # Resolved before the log is opened, because the log file is named after the section.
+    section_id = resolve_section(bids_root, subject, sample, stain)["base"]
+    log_path = os.path.join(out_dir, f"{section_id}_process.log")
     with _section_log(log_path):
         return _register(
-            subject_id, num_str, histo_type, spacing, orientation, flip, data_root, out_dir,
+            bids_root, subject, sample, stain, section_id, out_dir,
             profile=profile, device=device, ransac_sample_size=ransac_sample_size,
-            patch_size=patch_size, pclip=pclip, scale_max=scale_max, scale_step=scale_step,
+            pad_multiple=pad_multiple, pclip=pclip, scale_max=scale_max, scale_step=scale_step,
             lam_area=lam_area, lam_shape=lam_shape, w_rigid_mode=w_rigid_mode,
             mri_on_histo_tile_size=mri_on_histo_tile_size, save_roi_qc=save_roi_qc,
             verbose=verbose, settings=settings, matcher=matcher,
         )
 
 
-def _register(subject_id, num_str, histo_type, spacing, orientation, flip, data_root, out_dir, *,
-              profile, device, ransac_sample_size, patch_size, pclip, scale_max, scale_step,
+def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
+              profile, device, ransac_sample_size, pad_multiple, pclip, scale_max, scale_step,
               lam_area, lam_shape, w_rigid_mode, mri_on_histo_tile_size, save_roi_qc, verbose,
               settings, matcher):
     """Body of register_section, run while the section log file is attached."""
@@ -250,19 +270,22 @@ def _register(subject_id, num_str, histo_type, spacing, orientation, flip, data_
     section_start = time.perf_counter()
 
     # ---- Load ----
-    vols = load_section(subject_id, num_str, histo_type, spacing, orientation, flip, data_root)
+    vols = load_section(bids_root, subject, sample, stain)
     Ih_hr, Mh_hr, Im, Mm = vols["Ih_hr"], vols["Mh_hr"], vols["Im"], vols["Mm"]
     Ih_rgb_hr = vols.get("Ih_rgb_hr")
-    logger.info(f"Loaded section {subject_id}/{num_str}")
+    paths = vols["paths"]
+    logger.info(f"Loaded section {section_id}: {vols['orientation']}, "
+                f"rotation {vols['rotation']:g} deg, flip {vols['flip']}, "
+                f"spacing {tuple(round(v, 5) for v in vols['spacing'])} mm")
 
     # ---- Resample histology to MRI spacing (HR -> LR) ----
     Ih, Mh, A_hr_to_lr = resample_histo_to_mri(Ih_hr=Ih_hr, Mh_hr=Mh_hr, Im=Im)
 
-    # ---- Prepare histology (LR -> proc: pad to a multiple of the patch size) ----
+    # ---- Prepare histology (LR -> proc: pad to a multiple of pad_multiple) ----
     # scale_ratio (1, 1): no resizing here; the shrinkage scale is searched below.
     scale_ratio = (1, 1)
     proc_Ih, proc_Mh, A_lr_to_proc = prepare_histology(
-        Ih=Ih, Mh=Mh, scale_ratio=scale_ratio, patch_size=patch_size,
+        Ih=Ih, Mh=Mh, scale_ratio=scale_ratio, pad_multiple=pad_multiple,
         show_proc_img=False,
     )
     A_hr_to_proc = A_lr_to_proc @ A_hr_to_lr
@@ -332,7 +355,7 @@ def _register(subject_id, num_str, histo_type, spacing, orientation, flip, data_
     # clean matches) sets the common canvas, and its origin x0/y0 (MRI voxels) sets G's (u, v) frame.
     plane_img, x0, x1, y0, y1 = extract_roi_plane(clean_matches, pts_clean, slab_Im, device)
     if save_roi_qc:
-        _save_roi_qc(subject_id, num_str, out_dir, all_matches, clean_matches, best_patch,
+        _save_roi_qc(section_id, out_dir, all_matches, clean_matches, best_patch,
                      slab_Im, scaled_proc_Ih, plane_img, x0, y0, z_min, z_max)
 
     # ---- Common canvas ----
@@ -530,13 +553,21 @@ def _register(subject_id, num_str, histo_type, spacing, orientation, flip, data_
     plot_mri_on_sheet(
         hist_on_init_tps=hist_on_init_tps, valid_display=valid_display,
         mri_on_final_sheet=mri_on_final_sheet,
-        save_file=os.path.join(out_dir, f"{subject_id}_{num_str}_histo_in_mri_space_all.png"),
+        save_file=os.path.join(out_dir, f"{section_id}_histo_in_mri_space_all.png"),
     )
     # plot_mri_on_sheet's save_file_single saves only the MRI-on-sheet panel, so the
     # "Target Histology on Sheet" panel is saved separately.
     _save_target_histo_on_sheet(
-        subject_id=subject_id, num_str=num_str, out_dir=out_dir,
+        section_id=section_id, out_dir=out_dir,
         hist_on_init_tps=hist_on_init_tps, valid_display=valid_display,
+    )
+
+    # Where the section sits in the volume, rather than flattened on the canvas.
+    plot_histology_in_mri_space(
+        xyz_norm_final=_to_np(xyz_norm_final), valid_surf=_to_np(valid_display),
+        histo_on_surface=_to_np(hist_on_init_tps),
+        mri_zyx=sitk.GetArrayFromImage(slab_Im), mri_size=slab_Im.GetSize(),
+        save_file=os.path.join(out_dir, f"{section_id}_histo_in_mri_volume.png"),
     )
 
     # ---- Map back to HR histology (affine chain HR <-> common canvas) and QC ----
@@ -546,7 +577,7 @@ def _register(subject_id, num_str, histo_type, spacing, orientation, flip, data_
     logger.info("Composed A_common_to_hr")
 
     _save_mri_on_histo_space(
-        subject_id=subject_id, num_str=num_str, out_dir=out_dir,
+        section_id=section_id, out_dir=out_dir,
         tile_size=mri_on_histo_tile_size, verbose=verbose, Ih_hr=Ih_hr, Mh_hr=Mh_hr,
         proc_Ih=proc_Ih, scaled_proc_Ih=scaled_proc_Ih, A_hr_to_proc=A_hr_to_proc,
         oy_h=oy_h, ox_h=ox_h,
@@ -556,7 +587,7 @@ def _register(subject_id, num_str, histo_type, spacing, orientation, flip, data_
     )
 
     # ---- Save the transform (keys and frames: see the docstring) ----
-    save_path = os.path.join(out_dir, f"{subject_id}_{num_str}_transform_grid.npz")
+    save_path = os.path.join(out_dir, f"{section_id}_transform_grid.npz")
     np.savez_compressed(
         save_path,
         A_common_to_hr=_to_np(A_common_to_hr).astype(np.float64),
@@ -569,10 +600,32 @@ def _register(subject_id, num_str, histo_type, spacing, orientation, flip, data_
         G_e2=_to_np(G["e2"]).astype(np.float64),
         mri_spacing=np.asarray(slab_Im.GetSpacing(), dtype=np.float64),
         mri_size=np.asarray(slab_Im.GetSize(), dtype=np.int64),
-        subject_id=np.array(subject_id),
-        num_str=np.array(num_str),
+        # Voxel -> world for the permuted volume, so the sheet can be placed in millimetres
+        # rather than voxel numbers, and the permutation undone to reach the stored T1w.
+        mri_origin=np.asarray(slab_Im.GetOrigin(), dtype=np.float64),
+        mri_direction=np.asarray(slab_Im.GetDirection(), dtype=np.float64),
+        mri_permute=np.asarray(vols["mri_permute"], dtype=np.int64),
+        mri_view_flip=np.asarray(vols["mri_view_flip"], dtype=bool),
+        mri_orientation=np.array(vols["orientation"]),
+        mri_canonical=np.array(vols["mri_canonical"]),
+        mri_source=np.array(paths["mri"]),
+        # The two surfaces themselves, on the common canvas: histology resampled onto the
+        # sheet, and the MRI sampled on it. Canvas-sized, so cheap to keep; the full-
+        # resolution versions are regenerated from the affines above when wanted.
+        histo_on_surface=_to_np(hist_on_init_tps).astype(np.float32),
+        mri_on_surface=_to_np(mri_on_final_sheet).astype(np.float32),
+        # Back to the histology files: A_hr_to_tif undoes the flip and the rotation, and the
+        # crop values undo cleanslide's crop to reach the raw slide. -1 means "not cropped".
+        A_hr_to_tif=np.asarray(vols["A_hr_to_tif"], dtype=np.float64),
+        crop_origin_xy=np.asarray(vols["crop"]["crop_origin_xy"] or (-1, -1), dtype=np.int64),
+        source_shape_hw=np.asarray(vols["crop"]["source_shape_hw"] or (-1, -1), dtype=np.int64),
+        histo_source=np.array(paths["histo_gray"]),
+        subject_id=np.array(paths["subject"]),
+        sample=np.array(paths["sample"]),
+        stain=np.array(paths["stain"]),
+        section_id=np.array(section_id),
         profile=np.array(profile),
-        version=np.array([2], dtype=np.int32),
+        version=np.array([5], dtype=np.int32),
     )
     logger.info(f"Saved transform grid -> {save_path}")
 
@@ -593,7 +646,7 @@ def _register(subject_id, num_str, histo_type, spacing, orientation, flip, data_
     }
 
 
-def _save_target_histo_on_sheet(subject_id, num_str, out_dir, hist_on_init_tps, valid_display):
+def _save_target_histo_on_sheet(section_id, out_dir, hist_on_init_tps, valid_display):
     """Save the histology-on-sheet image, zeroed outside valid_display, as <prefix>_histo_in_mri_space.png.
 
     Same content and masking as the "Target Histology on Sheet" panel of plot_mri_on_sheet.
@@ -604,7 +657,7 @@ def _save_target_histo_on_sheet(subject_id, num_str, out_dir, hist_on_init_tps, 
     h_disp = h_disp.copy()
     h_disp[~np.asarray(valid_display, dtype=bool)] = 0.0
 
-    save_path = os.path.join(out_dir, f"{subject_id}_{num_str}_histo_in_mri_space.png")
+    save_path = os.path.join(out_dir, f"{section_id}_histo_in_mri_space.png")
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.imshow(h_disp, cmap="gray", origin="lower")
     ax.axis("off")
@@ -613,7 +666,7 @@ def _save_target_histo_on_sheet(subject_id, num_str, out_dir, hist_on_init_tps, 
     plt.close(fig)
 
 
-def _save_mri_on_histo_space(subject_id, num_str, out_dir, tile_size, verbose, Ih_hr, Mh_hr,
+def _save_mri_on_histo_space(section_id, out_dir, tile_size, verbose, Ih_hr, Mh_hr,
                               proc_Ih, scaled_proc_Ih, A_hr_to_proc, oy_h, ox_h,
                               xyz_norm_final, xy_map_sym, valid_display, mri_on_final_sheet,
                               slab_Im, device, Ih_rgb_hr=None):
@@ -624,8 +677,8 @@ def _save_mri_on_histo_space(subject_id, num_str, out_dir, tile_size, verbose, I
     writes <prefix>_mri_on_histo_rgb.png. A ValueError from the resampling (empty histology
     mask or empty valid_display) is logged and the step is skipped.
     """
-    save_file = os.path.join(out_dir, f"{subject_id}_{num_str}_mri_on_histo_all.png")
-    save_file_single = os.path.join(out_dir, f"{subject_id}_{num_str}_mri_on_histo.png")
+    save_file = os.path.join(out_dir, f"{section_id}_mri_on_histo_all.png")
+    save_file_single = os.path.join(out_dir, f"{section_id}_mri_on_histo.png")
 
     try:
         mri_on_hr_updated, final_valid_hr, _, _, _ = mri_on_histology_space(
@@ -655,16 +708,16 @@ def _save_mri_on_histo_space(subject_id, num_str, out_dir, tile_size, verbose, I
     arr_Ih_hr_2d = arr_Ih_hr[0] if arr_Ih_hr.ndim == 3 and arr_Ih_hr.shape[0] == 1 else arr_Ih_hr
     arr_Ih_rgb_hr = sitk.GetArrayFromImage(Ih_rgb_hr)[0]
 
-    save_file_rgb = os.path.join(out_dir, f"{subject_id}_{num_str}_mri_on_histo_rgb.png")
+    save_file_rgb = os.path.join(out_dir, f"{section_id}_mri_on_histo_rgb.png")
     plot_mri_on_histology_rgb(arr_Ih_hr_2d, arr_Ih_rgb_hr, mri_on_hr_updated,
                             tile=tile_size, save_file=save_file_rgb)
 
 
 
-def _save_roi_qc(subject_id, num_str, out_dir, all_matches, clean_matches, best_patch,
+def _save_roi_qc(section_id, out_dir, all_matches, clean_matches, best_patch,
                  slab_Im, scaled_proc_Ih, plane_img, x0, y0, z_min, z_max):
     """Save the three ROI QC figures (<prefix>_roi_pairs.png, _roi_3d.png, _roi_support.png)."""
-    prefix = os.path.join(out_dir, f"{subject_id}_{num_str}")
+    prefix = os.path.join(out_dir, f"{section_id}")
     show_matched_pairs(
         clean_matches, all_matches["hist_img"], all_matches["mri_img"],
         patch=best_patch, ncols=2, save_file=f"{prefix}_roi_pairs.png",

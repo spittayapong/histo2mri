@@ -1,0 +1,19 @@
+# Direct dependencies for the histo2mri package and its test suite.
+# Installed into the "histo2mri" conda env (mamba create -n histo2mri python=3.11).
+# Transitive versions actually resolved are pinned; re-resolve as needed.
+numpy==2.4.6
+scipy==1.17.1
+pandas==3.1.0
+matplotlib==3.11.2
+scikit-image==0.26.0
+SimpleITK==2.5.7
+imageio==2.38.1
+tqdm==4.70.1
+torch==2.15.0
+pytest==9.2.0
+
+# Only needed to use this env as a Jupyter kernel.
+ipykernel==7.4.0
+
+# Only needed to execute the demo notebook non-interactively (nbconvert --execute).
+nbconvert==7.17.2

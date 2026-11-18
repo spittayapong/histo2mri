@@ -812,7 +812,7 @@ def build_mri_bank_hog_mind(
             to the GPU (stays on CPU if that raises a RuntimeError).
 
     Returns:
-        dict with the same keys as build_mri_bank_hog_mind_ngf; m_patches is float32
+        dict with the same keys, and the same dtypes, as build_mri_bank_hog_mind_ngf
         [Nm, patch, patch].
 
     Raises:
@@ -882,7 +882,9 @@ def build_mri_bank_hog_mind(
 
         m_hog_list.append(hogk)
         m_mk_list.append(mkk.cpu())
-        m_patch_list.append(pim.cpu())
+        # float16, as build_mri_bank_hog_mind_ngf stores them: this is the largest part of
+        # the bank, and both readers cast it to float32 when they take a batch out of it.
+        m_patch_list.append(pim.half().cpu())
 
         n = int(keep_m.sum().item())
         zcol = torch.full((n, 1), z, dtype=torch.int32, device=dev).cpu()

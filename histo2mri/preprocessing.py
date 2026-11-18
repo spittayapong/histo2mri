@@ -45,13 +45,56 @@ def voxel_index_affine_hr_to_lr(spacing_hr, spacing_lr):
     return A
 
 
+def anti_alias_sigma_mm(spacing_hr, spacing_mri):
+    """Gaussian sigma, in mm per axis, for downsampling spacing_hr to spacing_mri.
+
+    The usual anti-aliasing rule is sigma = (f - 1) / 2 input pixels for a downsampling
+    factor f. Here f = spacing_mri / spacing_hr per axis, so in physical units that is
+    simply (spacing_mri - spacing_hr) / 2, independent of the pixel size. An axis that is
+    not downsampled gets 0.
+
+    Args:
+        spacing_hr: (x, y, z) histology spacing in mm.
+        spacing_mri: (x, y, z) MRI spacing in mm.
+    Returns:
+        (x, y, z) sigma in mm.
+    """
+    return tuple(max(0.0, (float(m) - float(h)) / 2.0) for h, m in zip(spacing_hr, spacing_mri))
+
+
+def _smooth_in_plane(img, sigma_mm):
+    """Gaussian-smooth an image along x and y only, with sigma given in mm.
+
+    z is left alone: a section is one slice thick, so there is nothing to smooth along it.
+    The axes are filtered separately rather than with a single vector sigma, because a
+    zero sigma is not a valid input to the combined filter.
+
+    Args:
+        img: 3D sitk.Image.
+        sigma_mm: (x, y, z) sigma in mm; only the first two are used.
+    Returns:
+        sitk.Image, unchanged (the same object) when both in-plane sigmas are 0.
+    """
+    out = img
+    for direction in (0, 1):
+        sigma = float(sigma_mm[direction])
+        if sigma > 0.0:
+            out = sitk.RecursiveGaussian(out, sigma=sigma, direction=direction)
+    return out
+
+
 def resample_histo_to_mri(Ih_hr, Mh_hr, Im):
     """Resample HR histology and its mask to the MRI voxel spacing.
 
     The output keeps the histology origin and direction, takes the MRI
     spacing, and has size ceil(size_hr * spacing_hr / spacing_mri) so the
-    physical extent is preserved. The image uses linear interpolation (no
-    anti-aliasing smoothing is applied) and the mask nearest-neighbour.
+    physical extent is preserved. The image uses linear interpolation and the mask
+    nearest-neighbour.
+
+    The histology is Gaussian-smoothed in plane first (anti_alias_sigma_mm), because the
+    downsampling factor is large -- about 12 for 31.75 um histology and 100 for 4 um
+    against 0.4 mm MRI -- and linear interpolation alone would alias cell-level texture
+    into noise. The mask is not smoothed: it is binary and resampled nearest-neighbour.
 
     Args:
         Ih_hr: HR histology, 3D sitk.Image (x, y, z), usually z size 1.
@@ -80,15 +123,20 @@ def resample_histo_to_mri(Ih_hr, Mh_hr, Im):
     # Kept so results can be mapped back to HR histology later
     A_hr_to_lr = voxel_index_affine_hr_to_lr(hist_spacing, mri_spacing)
 
+    # Anti-alias before the downsample; the mask below is deliberately left unsmoothed.
+    sigma_mm = anti_alias_sigma_mm(hist_spacing, mri_spacing)
+    logger.debug('Anti-alias sigma (mm): %s', tuple(round(s, 4) for s in sigma_mm))
+    Ih_hr_smoothed = _smooth_in_plane(Ih_hr, sigma_mm)
+
     # Resample histology to MRI spacing
     resampler = sitk.ResampleImageFilter()
-    resampler.SetReferenceImage(Ih_hr)
+    resampler.SetReferenceImage(Ih_hr_smoothed)
     resampler.SetOutputSpacing(mri_spacing)
     resampler.SetSize(hist_size_new)
     resampler.SetInterpolator(sitk.sitkLinear)
     resampler.SetOutputOrigin(Ih_hr.GetOrigin())
     resampler.SetOutputDirection(Ih_hr.GetDirection())
-    Ih = resampler.Execute(Ih_hr)
+    Ih = resampler.Execute(Ih_hr_smoothed)
 
     # Resample histology mask to MRI spacing
     resampler = sitk.ResampleImageFilter()
@@ -229,15 +277,16 @@ def scale_image_xy_grid(img, sx, sy, interp=sitk.sitkLinear):
     return img_scaled, scaled_size
 
 
-def pad_xy_to_patch_multiple(img, patch_size, constant=0):
-    """Pad x and y with a constant so both sizes are multiples of patch_size.
+def pad_xy_to_multiple(img, pad_multiple, constant=0):
+    """Pad x and y with a constant so both sizes are multiples of pad_multiple.
 
     Padding is split evenly between the lower and upper side (the extra pixel,
     if any, goes to the upper side); z is not padded.
 
     Args:
         img: 3D sitk.Image.
-        patch_size: patch edge length in pixels.
+        pad_multiple: padding granularity in pixels; x and y are padded up to a multiple
+            of it. It is not the matching patch size (that is searched, see register_section).
         constant: pad value.
 
     Returns:
@@ -247,8 +296,8 @@ def pad_xy_to_patch_multiple(img, patch_size, constant=0):
     size = np.array(img.GetSize(), dtype=int)  # (x,y,z)
 
     target = size.copy()
-    target[0] = int(np.ceil(size[0] / patch_size) * patch_size)
-    target[1] = int(np.ceil(size[1] / patch_size) * patch_size)
+    target[0] = int(np.ceil(size[0] / pad_multiple) * pad_multiple)
+    target[1] = int(np.ceil(size[1] / pad_multiple) * pad_multiple)
     target[2] = size[2]
 
     pad_total = target - size
@@ -271,7 +320,7 @@ def affine_lr_to_proc_voxel(Ih_lr, scaled_size_xyz, pad_lower_xyz):
     """Build the LR -> proc voxel-index affine.
 
     Models i_scaled ~= S * i_lr (scale_image_xy_grid) followed by
-    i_proc = i_scaled + pad_lower (pad_xy_to_patch_multiple), so
+    i_proc = i_scaled + pad_lower (pad_xy_to_multiple), so
     i_proc = A_lr_to_proc @ i_lr. S uses the effective scales
     scaled_size / lr_size from the integer image sizes; z is unchanged.
 
@@ -302,18 +351,19 @@ def affine_lr_to_proc_voxel(Ih_lr, scaled_size_xyz, pad_lower_xyz):
     return A
 
 
-def prepare_histology(Ih, Mh, scale_ratio, patch_size, show_proc_img=False, save_file=None):
-    """Scale the LR histology in-plane and pad it to a multiple of the patch size.
+def prepare_histology(Ih, Mh, scale_ratio, pad_multiple, show_proc_img=False, save_file=None):
+    """Scale the LR histology in-plane and pad it to a multiple of pad_multiple.
 
     The image is scaled with linear and the mask with nearest-neighbour
     interpolation (scale_image_xy_grid), then both are zero-padded in x and y
-    (pad_xy_to_patch_multiple). Intensities are not normalised here.
+    (pad_xy_to_multiple). Intensities are not normalised here.
 
     Args:
         Ih: LR histology (at MRI spacing), sitk.Image.
         Mh: LR histology mask, sitk.Image.
         scale_ratio: (sy, sx) in-plane scale factors; the pipeline uses (1, 1).
-        patch_size: patch edge length in pixels.
+        pad_multiple: padding granularity in pixels; x and y are padded up to a multiple
+            of it. It is not the matching patch size (that is searched, see register_section).
         show_proc_img: if True, show the prepared image and mask.
         save_file: optional output path for that figure.
 
@@ -330,8 +380,8 @@ def prepare_histology(Ih, Mh, scale_ratio, patch_size, show_proc_img=False, save
     Mh_scaled, _ = scale_image_xy_grid(Mh, sx, sy, interp=sitk.sitkNearestNeighbor)
 
     # 2) pad XY to patch multiple
-    pad_Ih, pad_lower, pad_upper = pad_xy_to_patch_multiple(Ih_scaled, patch_size, constant=0)
-    proc_Mh, _, _ = pad_xy_to_patch_multiple(Mh_scaled, patch_size, constant=0)
+    pad_Ih, pad_lower, pad_upper = pad_xy_to_multiple(Ih_scaled, pad_multiple, constant=0)
+    proc_Mh, _, _ = pad_xy_to_multiple(Mh_scaled, pad_multiple, constant=0)
 
     # 3) LR -> proc voxel-index affine (steps 1 and 2)
     A_lr_to_proc = affine_lr_to_proc_voxel(Ih, scaled_size, pad_lower)

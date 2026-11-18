@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "histo2mri"
+version = "0.1.0"
+description = "Registration of 2D histology sections to a 3D MRI volume"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Sutatip Pittayapong" }]
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["histology", "MRI", "registration", "neuroimaging", "BIDS"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+# Lower bounds only, so the package installs alongside other things; the exact
+# versions this was developed and tested against are in requirements.txt.
+dependencies = [
+    "numpy>=2.0",
+    "scipy>=1.10",
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+    "scikit-image>=0.22",
+    "SimpleITK>=2.3",
+    "imageio>=2.30",
+    "tqdm>=4.65",
+    # The matching, TPS fitting and sheet refinement run on torch; a CUDA build is
+    # strongly preferred (see the Requirements section of the README), but the CPU
+    # build works and is what a plain `pip install` gives.
+    "torch>=2.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/spittayapong/histo2mri"
+Source = "https://github.com/spittayapong/histo2mri"
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+# Only needed to use the environment as a Jupyter kernel for the demo notebook.
+dev = ["ipykernel>=6.0"]
+
+[project.scripts]
+histo2mri = "histo2mri.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["histo2mri*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The end-to-end smoke test runs the whole pipeline on synthetic data; the sheet refinement
+# makes it far slower than the rest. Skip it with: pytest -m "not slow"
+markers = ["slow: end-to-end tests that run the full pipeline"]

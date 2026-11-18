@@ -5,6 +5,13 @@ Covers the prepared images (preprocessing), patch matches and the ROI plane
 and the MRI mapped back onto full-resolution histology (inverse). Volumes are
 indexed (z, y, x); match points are MRI voxel indices (z, y, x). Figures are
 shown with matplotlib and saved only when a path is given.
+
+Images are drawn with row 0 at the top. Since io.load_mri puts the volume in
+the viewer frame (io.VIEW_AXES: +x screen-right, +y screen-down), that is the
+orientation a viewer shows: Superior up and Left to the right for a coronal
+section. The exceptions are the XZ and YZ projections of
+visualize_roi_from_matches, whose vertical axis is the through-plane z plotted
+as an ordinary y axis.
 """
 import numpy as np
 import SimpleITK as sitk
@@ -52,10 +59,10 @@ def show_proc_image(img, mask, title, idx=0, save_file=None):
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))  # 1 row, 2 columns
 
-    axes[0].imshow(np.flipud(arr_img), cmap='gray')
+    axes[0].imshow(arr_img, cmap='gray')
     axes[0].set_title(f"Processed {title}")
 
-    axes[1].imshow(np.flipud(arr_mask), cmap='gray')
+    axes[1].imshow(arr_mask, cmap='gray')
     axes[1].set_title(f"Processed {title} Mask")
 
     plt.tight_layout()
@@ -66,7 +73,7 @@ def show_proc_image(img, mask, title, idx=0, save_file=None):
         os.makedirs(os.path.dirname(save_file) or '.', exist_ok=True)
 
         fig2, ax2 = plt.subplots(figsize=(6, 6))
-        ax2.imshow(np.flipud(arr_img), cmap='gray')
+        ax2.imshow(arr_img, cmap='gray')
         ax2.set_title(f"Processed {title}")
         ax2.axis("on")
 
@@ -154,14 +161,14 @@ def show_matched_pairs(
         hp = hist_img[hy0:hy0 + patch, hx0:hx0 + patch]
         mp = mri_img[mz, my0:my0 + patch, mx0:mx0 + patch]
 
-        axes[r, c0].imshow(np.flipud(hp), cmap="gray")
+        axes[r, c0].imshow(hp, cmap="gray")
         axes[r, c0].set_title(
             f"Hist idx={m['hist_index']} center={m['hist_center_yx']}",
             fontsize=9
         )
         axes[r, c0].axis("off")
 
-        axes[r, c1].imshow(np.flipud(mp), cmap="gray")
+        axes[r, c1].imshow(mp, cmap="gray")
         axes[r, c1].set_title(
             f"MRI {m['mri_center_zyx']} score={m['score']:.3f}",
             fontsize=9
@@ -175,7 +182,7 @@ def show_matched_pairs(
             overlap = hm & mm
             overlap_frac = overlap.mean()
 
-            axes[r, c2].imshow(np.flipud(overlap.astype(np.uint8) * 255), cmap="gray", vmin=0, vmax=255)
+            axes[r, c2].imshow(overlap.astype(np.uint8) * 255, cmap="gray", vmin=0, vmax=255)
             axes[r, c2].set_title(f"Overlap frac={overlap_frac:.3f}", fontsize=9)
             axes[r, c2].axis("off")
 
@@ -417,12 +424,12 @@ def plot_roi_support(clean_matches, scaled_proc_Ih, plane_img, x0, y0, step=1.0,
     plane_cov_valid = float((inside_p & finite).sum() / max(finite.sum(), 1))
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-    axes[0].imshow(h, cmap="gray", origin="lower")
+    axes[0].imshow(h, cmap="gray")
     axes[0].scatter(pts_hist[:, 0], pts_hist[:, 1], s=8, c="lime")
     axes[0].plot(np.r_[poly_h[:, 0], poly_h[0, 0]], np.r_[poly_h[:, 1], poly_h[0, 1]], c="cyan", lw=1.2)
     axes[0].set_title(f"Histology support (hull cov={hist_cov:.3f})")
     axes[0].axis("off")
-    axes[1].imshow(np.nan_to_num(plane_img, nan=0.0), cmap="gray", origin="lower")
+    axes[1].imshow(np.nan_to_num(plane_img, nan=0.0), cmap="gray")
     axes[1].scatter(pts_px_in[:, 0], pts_px_in[:, 1], s=8, c="lime")
     axes[1].plot(np.r_[poly_p[:, 0], poly_p[0, 0]], np.r_[poly_p[:, 1], poly_p[0, 1]], c="cyan", lw=1.2)
     axes[1].set_title(f"Plane support (all={plane_cov_all:.3f}, valid={plane_cov_valid:.3f})")
@@ -500,9 +507,7 @@ def plot_mri_on_sheet(
 
     def _checker(a, b, tile=24):
         aa, bb = _norm01(a), _norm01(b)
-        yy, xx = np.indices(aa.shape)
-        m = ((yy // tile + xx // tile) % 2).astype(bool)
-        return np.where(m, aa, bb)
+        return np.where(~checker_mask(aa.shape, tile), aa, bb)
 
     h = _to_2d(hist_on_init_tps, dtype=np.float32)
     v = _to_2d(valid_display, dtype=np.float32) > 0.5
@@ -526,17 +531,17 @@ def plot_mri_on_sheet(
     ncols = 4 if show_checker else 3
     fig, ax = plt.subplots(1, ncols, figsize=(5 * ncols, 5))
 
-    ax[0].imshow(h_disp, cmap="gray", origin="lower")
+    ax[0].imshow(h_disp, cmap="gray")
     ax[0].set_title("Target Histology on Sheet")
 
-    ax[1].imshow(v.astype(np.float32), cmap="gray", origin="lower")
+    ax[1].imshow(v.astype(np.float32), cmap="gray")
     ax[1].set_title("Valid Display Region")
 
-    ax[2].imshow(r_disp, cmap="gray", origin="lower")
+    ax[2].imshow(r_disp, cmap="gray")
     ax[2].set_title("MRI on Final Sheet")
 
     if show_checker:
-        ax[3].imshow(_checker(h_disp, r_disp, tile=checker_tile), cmap="gray", origin="lower")
+        ax[3].imshow(_checker(h_disp, r_disp, tile=checker_tile), cmap="gray")
         ax[3].set_title(f"Checkerboard (tile={checker_tile})")
 
     for a in ax:
@@ -558,7 +563,7 @@ def plot_mri_on_sheet(
         if d:
             os.makedirs(d, exist_ok=True)
         fig3, ax3 = plt.subplots(figsize=(6, 6))
-        ax3.imshow(r_disp, cmap="gray", origin="lower")
+        ax3.imshow(r_disp, cmap="gray")
         ax3.axis("off")
         fig3.tight_layout(pad=0)
         fig3.savefig(save_file_single, dpi=300, bbox_inches="tight", pad_inches=0)
@@ -584,6 +589,26 @@ def normalize_image(img, eps=1e-8):
     return (img - min_val) / (max_val - min_val + eps)
 
 
+def checker_mask(shape, tile_size):
+    """Boolean checkerboard: True where the tile index (row + column) is even.
+
+    Built by broadcasting two 1-D index arrays rather than np.indices, which would
+    materialise two int64 arrays the size of the image. At full histology resolution those
+    are over a gigabyte each, and nothing but the tile parity is ever read from them.
+
+    Args:
+        shape: (height, width) of the image the pattern is for.
+        tile_size: Tile edge length in pixels.
+    Returns:
+        (height, width) bool array.
+    """
+    height, width = int(shape[0]), int(shape[1])
+    tile = int(tile_size)
+    rows = (np.arange(height, dtype=np.int32) // tile)[:, None]
+    cols = (np.arange(width, dtype=np.int32) // tile)[None, :]
+    return (rows + cols) % 2 == 0
+
+
 def make_checkerboard(a, b, tile_size=32):
     """Build a checkerboard composite of two images after min-max normalization.
 
@@ -607,8 +632,8 @@ def make_checkerboard(a, b, tile_size=32):
 
     h, w = a.shape
 
-    yy, xx = np.indices((h, w))
-    mask = ((yy // tile_size + xx // tile_size) % 2).astype(bool)
+    # Odd tiles take a, so the tile at (0, 0) shows b, as the docstring states.
+    mask = ~checker_mask((h, w), tile_size)
 
     out = np.where(mask, a_norm, b_norm)
     return out
@@ -644,9 +669,9 @@ def plot_mri_on_histology(mri_on_histo, Ih_hr, Mh_hr, tile_size=384, save_file=N
     arr_Ih_hr = sitk.GetArrayFromImage(Ih_hr)[0]
     arr_Mh_hr = sitk.GetArrayFromImage(Mh_hr)[0]
 
-    hist_disp = np.flipud(arr_Ih_hr).astype(np.float32)
-    mri_disp  = np.flipud(mri_on_histo).astype(np.float32)
-    mask_disp = np.flipud(arr_Mh_hr).astype(np.float32)
+    hist_disp = arr_Ih_hr.astype(np.float32)
+    mri_disp  = np.asarray(mri_on_histo).astype(np.float32)
+    mask_disp = arr_Mh_hr.astype(np.float32)
 
     # Restrict both images to the histology mask.
     hist_disp = hist_disp * mask_disp
@@ -732,8 +757,8 @@ def plot_mri_on_histology_rgb(
       histology and MRI.
 
     In both checkerboards the tile at array index (0, 0) shows histology.
-    Images are drawn with ``origin="lower"`` and optionally flipped
-    vertically first.
+    Images are drawn row 0 at the top, and optionally flipped vertically
+    first (``flip_display``).
     The figure is saved at 300 dpi if ``save_file`` is given.
 
     Args:
@@ -802,17 +827,18 @@ def plot_mri_on_histology_rgb(
     )
     histo_lut = apply_lut_monotone(h01, xq, yq)
 
-    rgb = hist_rgb.copy()
+    # to_rgb3 already returned a fresh float32 array, so it is scaled in place rather than
+    # copied again: at full histology resolution each of these is over a gigabyte.
+    rgb = hist_rgb
     if rgb.max() > 1.0:
         rgb /= 255.0
 
-    mri_rgb = np.repeat(m01[..., None], 3, axis=-1)
-
-    yy, xx = np.indices(h01.shape)
-    cb = ((yy // int(tile) + xx // int(tile)) % 2 == 0)
+    cb = checker_mask(h01.shape, tile)
 
     checker_lut = np.where(cb, histo_lut, m01)
-    checker_rgb = np.where(cb[..., None], rgb, mri_rgb)
+    # m01[..., None] broadcasts across the three channels, so the grey MRI never has to be
+    # expanded into a full three-channel copy just to be read here.
+    checker_rgb = np.where(cb[..., None], rgb, m01[..., None])
 
     if mask is not None:
         histo_lut_disp   = np.where(mask, histo_lut, 1.0)
@@ -839,18 +865,18 @@ def plot_mri_on_histology_rgb(
 
     fig, ax = plt.subplots(2, 3, figsize=(20, 14))
 
-    ax[0, 0].imshow(histo_lut_disp, cmap="gray", origin="lower")
+    ax[0, 0].imshow(histo_lut_disp, cmap="gray")
     ax[0, 0].set_title("Histology (LUT -> MRI)")
-    ax[0, 1].imshow(m01_disp, cmap="gray", origin="lower")
+    ax[0, 1].imshow(m01_disp, cmap="gray")
     ax[0, 1].set_title("MRI (robust01)")
-    ax[0, 2].imshow(checker_lut_disp, cmap="gray", origin="lower")
+    ax[0, 2].imshow(checker_lut_disp, cmap="gray")
     ax[0, 2].set_title(f"Checkerboard LUT (tile={tile})")
 
-    ax[1, 0].imshow(rgb_disp, origin="lower")
+    ax[1, 0].imshow(rgb_disp)
     ax[1, 0].set_title("RGB Histo")
-    ax[1, 1].imshow(m01_disp, cmap="gray", origin="lower")
+    ax[1, 1].imshow(m01_disp, cmap="gray")
     ax[1, 1].set_title("MRI on Histo")
-    ax[1, 2].imshow(checker_rgb_disp, origin="lower")
+    ax[1, 2].imshow(checker_rgb_disp)
     ax[1, 2].set_title(f"Checkerboard RGB (tile={tile})")
 
     for a in ax.ravel():
@@ -892,6 +918,94 @@ def _plot_surface(z_tensor, title, save_file=None):
     if save_file is not None:
         os.makedirs(os.path.dirname(save_file) or '.', exist_ok=True)
         fig.savefig(save_file, dpi=300, bbox_inches="tight")
+        logger.debug(f'Saved figure to: {save_file}')
+
+    _show()
+    plt.close(fig)
+
+
+def plot_histology_in_mri_space(
+    xyz_norm_final,
+    valid_surf,
+    histo_on_surface,
+    mri_zyx,
+    mri_size,
+    save_file=None,
+    max_points=20000,
+):
+    """Show where the section sits inside the MRI: the sheet in 3D, and the slices it cuts.
+
+    Four panels. The first draws the refined sheet as a point cloud at its MRI voxel
+    positions, coloured by the histology sampled on it, inside the volume's bounding box:
+    this is the histology placed in MRI space, and the same geometry a 3D viewer would be
+    given. The other three show the MRI slice nearest the sheet's centre along each axis,
+    with the sheet's intersection drawn on it, so the cut can be read against the anatomy.
+
+    Positions are MRI voxel indices of the orientation-permuted volume, the frame
+    xyz_norm_final is stored in. Converting to millimetres needs that volume's origin,
+    spacing and direction, which the transform .npz records alongside this.
+
+    Args:
+        xyz_norm_final: (Hc, Wc, 3) sheet, MRI (x, y, z) divided by (X-1, Y-1, Z-1).
+        valid_surf: (Hc, Wc) truthy where the sheet is usable.
+        histo_on_surface: (Hc, Wc) histology resampled on the canvas; colours the cloud.
+        mri_zyx: MRI volume as a (Z, Y, X) array, for the slice panels.
+        mri_size: (X, Y, Z) size of the permuted MRI, to undo the normalisation.
+        save_file: Path to write the figure to; not saved when None.
+        max_points: Upper bound on plotted sheet points; the cloud is thinned to it.
+    """
+    valid = np.asarray(valid_surf).astype(bool)
+    if not valid.any():
+        logger.warning('No valid sheet points; skipping the histology-in-MRI-space figure.')
+        return
+
+    size = np.asarray(mri_size, dtype=float)
+    xyz = np.asarray(xyz_norm_final, dtype=float)[valid] * (size - 1)   # [N, 3] in (x, y, z)
+    colour = np.asarray(histo_on_surface, dtype=float)[valid]
+
+    # Thin by a stride rather than at random, so the figure is the same on every run.
+    if len(xyz) > max_points:
+        step = int(np.ceil(len(xyz) / max_points))
+        xyz, colour = xyz[::step], colour[::step]
+
+    lo, hi = np.percentile(colour, [1, 99])
+    colour_norm = np.clip((colour - lo) / (hi - lo + 1e-8), 0, 1)
+
+    fig = plt.figure(figsize=(21, 5.6))
+    ax3d = fig.add_subplot(1, 4, 1, projection='3d')
+    # A sequential colour map rather than gray: most of a section is dark, and dark grey on
+    # a white 3D panel is unreadable. The axes keep the volume's proportions, so the sheet's
+    # tilt and its position in the volume are both honest.
+    ax3d.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c=colour_norm, cmap='viridis',
+                 s=3.0, linewidths=0, vmin=0, vmax=1, depthshade=False)
+    ax3d.set_xlim(0, size[0]); ax3d.set_ylim(0, size[1]); ax3d.set_zlim(0, size[2])
+    ax3d.set_box_aspect(size)
+    ax3d.view_init(elev=22, azim=-60)
+    ax3d.set_xlabel('x'); ax3d.set_ylabel('y'); ax3d.set_zlabel('z')
+    ax3d.set_title('histology on the sheet, in MRI voxel space')
+
+    # One slice per axis, taken where the sheet is centred along that axis. take() indexes
+    # the (Z, Y, X) volume; the rows and columns of what it returns are the two axes that
+    # were not sliced, and u/v are given in that same order.
+    vol = np.asarray(mri_zyx)
+    centre = np.round(xyz.mean(axis=0)).astype(int)                     # (x, y, z)
+    panels = (
+        ('x', 0, lambda i: vol[:, :, i], (xyz[:, 1], xyz[:, 2]), ('y', 'z')),
+        ('y', 1, lambda i: vol[:, i, :], (xyz[:, 0], xyz[:, 2]), ('x', 'z')),
+        ('z', 2, lambda i: vol[i, :, :], (xyz[:, 0], xyz[:, 1]), ('x', 'y')),
+    )
+    for panel, (axis_name, axis, take, (u, v), (u_name, v_name)) in enumerate(panels, start=2):
+        index = int(np.clip(centre[axis], 0, vol.shape[2 - axis] - 1))
+        ax = fig.add_subplot(1, 4, panel)
+        ax.imshow(take(index), cmap='gray')
+        ax.scatter(u, v, s=0.3, c='tab:orange', linewidths=0)
+        ax.set_title(f'MRI {axis_name} = {index}, sheet on it')
+        ax.set_xlabel(u_name); ax.set_ylabel(v_name)
+        ax.set_xticks([]); ax.set_yticks([])
+
+    fig.tight_layout()
+    if save_file:
+        fig.savefig(save_file, dpi=110)
         logger.debug(f'Saved figure to: {save_file}')
 
     _show()
