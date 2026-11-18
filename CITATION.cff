@@ -7,25 +7,61 @@ abstract: >-
   serial sections, a block-face photograph or any other auxiliary data. Each
   section is mapped onto a curved sheet in MRI voxel space, so a point on the
   slide and a point in the volume convert into each other in both directions.
+# CFF allows one affiliation per author, so authors with several are given them
+# in one string, separated by semicolons.
 authors:
   - given-names: Sutatip
     family-names: Pittayapong
+    affiliation: >-
+      Department of Medical Engineering, Carinthia University of Applied Sciences,
+      Klagenfurt, Austria; Division of Neuropathology and Neurochemistry, Department of
+      Neurology, Medical University of Vienna, Vienna, Austria
   - given-names: Beáta
     family-names: Bachratá
+    affiliation: >-
+      Department of Medical Engineering, Carinthia University of Applied Sciences,
+      Klagenfurt, Austria
   - given-names: Irene
     family-names: Erber
+    affiliation: >-
+      Division of Neuropathology and Neurochemistry, Department of Neurology, Medical
+      University of Vienna, Vienna, Austria; Comprehensive Center for Clinical
+      Neurosciences & Mental Health, Medical University of Vienna, Austria
   - given-names: Verena
     family-names: Endmayr
+    affiliation: >-
+      Division of Neuropathology and Neurochemistry, Department of Neurology, Medical
+      University of Vienna, Vienna, Austria; Comprehensive Center for Clinical
+      Neurosciences & Mental Health, Medical University of Vienna, Austria
   - given-names: Christian
     family-names: Menard
+    affiliation: >-
+      Department of Medical Engineering, Carinthia University of Applied Sciences,
+      Klagenfurt, Austria
   - given-names: Wolfgang
     family-names: Bogner
+    affiliation: >-
+      High Field MR Center, Department of Biomedical Imaging and Image-Guided Therapy,
+      Medical University of Vienna, Vienna, Austria; Christian Doppler Laboratory for MR
+      Imaging Biomarkers (BIOMAK), Department of Biomedical Imaging and Image-guided
+      Therapy, Medical University of Vienna
   - given-names: Romana
     family-names: Höftberger
+    affiliation: >-
+      Division of Neuropathology and Neurochemistry, Department of Neurology, Medical
+      University of Vienna, Vienna, Austria; Comprehensive Center for Clinical
+      Neurosciences & Mental Health, Medical University of Vienna, Austria
   - given-names: Simon
     family-names: Hametner
+    affiliation: >-
+      Division of Neuropathology and Neurochemistry, Department of Neurology, Medical
+      University of Vienna, Vienna, Austria; Comprehensive Center for Clinical
+      Neurosciences & Mental Health, Medical University of Vienna, Austria
   - given-names: Günther
     family-names: Grabner
+    affiliation: >-
+      Department of Medical Engineering, Carinthia University of Applied Sciences,
+      Klagenfurt, Austria
 version: 0.1.0
 license: MIT
 repository-code: "https://github.com/spittayapong/histo2mri"

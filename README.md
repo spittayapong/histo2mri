@@ -234,8 +234,9 @@ offers through its "Cite this repository" button:
 > Registration: An Automated 2D-to-3D Approach Without Auxiliary Data* (version 0.1.0)
 > [Computer software]. https://github.com/spittayapong/histo2mri
 
-There is no release tag yet, so quote the commit you used — `git rev-parse --short HEAD` —
-alongside the version. A tagged release and the paper reference will be added here.
+Until a stable release, the tags here are pre-releases: quote the one you used, or the
+commit hash from `git rev-parse --short HEAD`, alongside the version. The paper reference
+will be added here.
 
 ## License
 
