@@ -108,6 +108,37 @@ as the prefix. `--histo-pixel-size` is in micrometres (one value, or `X Y`); `--
 and default to none. `--histo-rgb` adds an RGB histology for the QC figures. The command exits
 with status 1 if the section fails, so a batch script can loop over sections and check it.
 
+### Cleaning raw histology first
+
+histo2mri registers a *cleaned* section: an inverted grayscale with the background at 0, a
+tissue mask and, for QC, the colour section. [cleanslide](https://github.com/spittayapong/cleanslide)
+makes these from a raw brightfield slide. If your histology is not cleaned yet, add
+`--cleanslide` and both steps run in one go. It needs the optional dependency:
+
+```bash
+pip install "histo2mri[cleanslide]"
+```
+
+With `register`, `--histo` is then the raw RGB slide, and `--histo-mask`/`--histo-rgb` are left
+out, because cleanslide makes them:
+
+```bash
+histo2mri register --cleanslide --histo raw_slide.tif \
+    --mri T1w.nii.gz --mri-mask brain_mask.nii.gz \
+    --orientation coronal --histo-pixel-size 4 --flip x -o out/section
+```
+
+The cleaned image, mask, colour image and sidecar are written as `out/section_desc-*`, and
+cleanslide's QC panels as `out/section_cleanslide_outputs.png` and `..._cleanslide_qc.png`.
+With `bids`, the raw `sub-X/micr/*_BF.tif` sections are cleaned into `<output_dir>/cleanslide/`
+(a cleanslide derivative, with its QC panels in `qc/`) and registered from there; the input
+dataset is only read.
+
+`--cleanslide-background-threshold N|auto` sets the grey level above which a pixel counts as
+slide. `bids` otherwise takes it from each section's sidecar (`BackgroundThreshold`), and both
+fall back to cleanslide's default of 240. Look at the QC panels: a bad clean does not fail,
+it shows up as a bad registration.
+
 ### A BIDS dataset
 
 `bids` is a [BIDS App](https://bids-apps.neuroimaging.io/): it takes the dataset, the

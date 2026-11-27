@@ -146,7 +146,7 @@ def _section_log(log_path):
         pkg_logger.setLevel(old_level)
 
 
-def register_section(bids_root, subject, sample, out_dir, *, stain=None,
+def register_section(bids_root, subject, sample, out_dir, *, stain=None, histo_root=None,
                      profile="default", device=None, ransac_sample_size=5,
                      pad_multiple=64, pclip=(1, 99), scale_max=1.30, scale_step=0.05,
                      lam_area=2.0, lam_shape=0.0, w_rigid_mode="mask",
@@ -177,6 +177,8 @@ def register_section(bids_root, subject, sample, out_dir, *, stain=None,
         stain: Stain label; optional when the subject and sample identify one section.
             The cutting plane, in-plane rotation, flip and pixel size are read from the
             section's sidecars by io.load_section.
+        histo_root: Root of the cleanslide derivative holding the cleaned histology;
+            defaults to <bids_root>/derivatives/cleanslide.
         profile: Key of PROFILES selecting the outlier-filter and refinement settings.
         device: torch device (or string) for matching, TPS fitting and refinement; defaults
             to "cuda:0" when CUDA is available, otherwise "cpu".
@@ -271,9 +273,10 @@ def register_section(bids_root, subject, sample, out_dir, *, stain=None,
             example too few matches) propagate unchanged.
     """
     # Resolved before the log is opened, because the log file is named after the section.
-    section_id = resolve_section(bids_root, subject, sample, stain)["base"]
+    section_id = resolve_section(bids_root, subject, sample, stain, histo_root)["base"]
     return _run_section(
-        lambda: load_section(bids_root, subject, sample, stain), section_id, out_dir,
+        lambda: load_section(bids_root, subject, sample, stain, histo_root=histo_root),
+        section_id, out_dir,
         profile=profile, device=device, ransac_sample_size=ransac_sample_size,
         pad_multiple=pad_multiple, pclip=pclip, scale_max=scale_max, scale_step=scale_step,
         lam_area=lam_area, lam_shape=lam_shape, w_rigid_mode=w_rigid_mode,
@@ -292,7 +295,7 @@ def _histo_stem(path):
 
 
 def register_files(histo, histo_mask, mri, mri_mask, out_dir, *, orientation, pixel_size_um,
-                   rotation=0.0, flip="", histo_rgb=None, section_id=None,
+                   rotation=0.0, flip="", histo_rgb=None, crop=None, section_id=None,
                    profile="default", device=None, ransac_sample_size=5,
                    pad_multiple=64, pclip=(1, 99), scale_max=1.30, scale_step=0.05,
                    lam_area=2.0, lam_shape=0.0, w_rigid_mode="mask",
@@ -302,8 +305,8 @@ def register_files(histo, histo_mask, mri, mri_mask, out_dir, *, orientation, pi
 
     The same pipeline as register_section; only the loading differs (io.load_files). What
     the BIDS sidecars would provide -- cutting plane, rotation, flip and pixel size -- is
-    passed in, and there is no cleanslide crop to record (crop_origin_xy and
-    source_shape_hw are saved as -1, and subject_id, sample and stain as "").
+    passed in. subject_id, sample and stain are saved as "", and crop_origin_xy and
+    source_shape_hw as -1 unless crop is given.
 
     Args:
         histo: Gray histology image (2D TIFF or any format SimpleITK reads).
@@ -319,6 +322,9 @@ def register_files(histo, histo_mask, mri, mri_mask, out_dir, *, orientation, pi
             histology before the flip (as SectionRotation in io).
         flip: Letters from x/y/z, "" for none (as SectionFlip in io).
         histo_rgb: Optional RGB histology on the same grid, used only for QC figures.
+        crop: Optional dict with "crop_origin_xy" and "source_shape_hw": where histo sits
+            in the raw slide it was cropped from (see io.read_crop_metadata). Saved in the
+            transform; -1 when omitted.
         section_id: Prefix of the output files; defaults to the histology file name
             without its extension.
         profile, device, ...: As in register_section.
@@ -332,7 +338,7 @@ def register_files(histo, histo_mask, mri, mri_mask, out_dir, *, orientation, pi
     return _run_section(
         lambda: load_files(histo, histo_mask, mri, mri_mask, orientation=orientation,
                            pixel_size_mm=pixel_size_mm, rotation=rotation, flip=flip,
-                           histo_rgb=histo_rgb),
+                           histo_rgb=histo_rgb, crop=crop),
         section_id, out_dir,
         profile=profile, device=device, ransac_sample_size=ransac_sample_size,
         pad_multiple=pad_multiple, pclip=pclip, scale_max=scale_max, scale_step=scale_step,

@@ -176,7 +176,12 @@ def _entity(value, prefix):
     return text if text.startswith(prefix) else prefix + text
 
 
-def resolve_section(bids_root, subject, sample, stain=None):
+def _histo_root(bids_root, histo_root):
+    """The cleanslide derivative to read: histo_root, or the dataset's own by default."""
+    return histo_root or os.path.join(bids_root, "derivatives", BIDS_HISTO_SOURCE)
+
+
+def resolve_section(bids_root, subject, sample, stain=None, histo_root=None):
     """Find the files of one section in a BIDS dataset.
 
     Args:
@@ -185,6 +190,8 @@ def resolve_section(bids_root, subject, sample, stain=None):
         sample: Sample label, with or without the "sample-" prefix.
         stain: Stain label, with or without the "stain-" prefix. May be omitted when the
             subject and sample identify exactly one section.
+        histo_root: Root of the cleanslide derivative holding the cleaned histology;
+            defaults to <bids_root>/derivatives/cleanslide.
     Returns:
         Dict of paths with the keys "histo_gray", "histo_mask", "histo_rgb",
         "histo_sidecar", "section_sidecar", "mri", "mri_mask", plus "subject", "sample",
@@ -195,7 +202,7 @@ def resolve_section(bids_root, subject, sample, stain=None):
     """
     sub = _entity(subject, "sub-")
     samp = _entity(sample, "sample-")
-    histo_dir = os.path.join(bids_root, "derivatives", BIDS_HISTO_SOURCE, sub, "micr")
+    histo_dir = os.path.join(_histo_root(bids_root, histo_root), sub, "micr")
 
     suffix = "_desc-clean_BF.tif"
     candidates = sorted(glob.glob(os.path.join(histo_dir, f"{sub}_{samp}_stain-*{suffix}")))
@@ -249,7 +256,7 @@ def write_dataset_description(out_dir, version):
     return path
 
 
-def find_sections(bids_root, subject=None, sample=None, stain=None):
+def find_sections(bids_root, subject=None, sample=None, stain=None, histo_root=None):
     """List the sections of a dataset, narrowed by whichever entities are given.
 
     The dataset itself is the list of what there is to process; each entity left as None
@@ -260,6 +267,7 @@ def find_sections(bids_root, subject=None, sample=None, stain=None):
         subject: Subject label, with or without the "sub-" prefix, or None for all.
         sample: Sample label, with or without the "sample-" prefix, or None for all.
         stain: Stain label, with or without the "stain-" prefix, or None for all.
+        histo_root: Root of the cleanslide derivative; see resolve_section.
     Returns:
         List of dicts with "subject", "sample", "stain" and "base", sorted by file name.
     """
@@ -268,7 +276,7 @@ def find_sections(bids_root, subject=None, sample=None, stain=None):
     st = _entity(stain, "stain-") if stain else "stain-*"
 
     suffix = "_desc-clean_BF.tif"
-    pattern = os.path.join(bids_root, "derivatives", BIDS_HISTO_SOURCE, sub, "micr",
+    pattern = os.path.join(_histo_root(bids_root, histo_root), sub, "micr",
                            f"{sub}_{samp}_{st}{suffix}")
 
     sections = []
@@ -694,7 +702,7 @@ def load_files(histo, histo_mask, mri, mri_mask, *, orientation, pixel_size_mm,
 
 
 def load_section(bids_root, subject, sample, stain=None, *,
-                 orientation=None, rotation=None, flip=None, spacing=None):
+                 orientation=None, rotation=None, flip=None, spacing=None, histo_root=None):
     """Load one section's histology, its mask, the optional RGB histology, the MRI and its mask.
 
     Finds the section's files in the BIDS dataset (resolve_section), reads the placement
@@ -711,6 +719,7 @@ def load_section(bids_root, subject, sample, stain=None, *,
         rotation: Override for SectionRotation, in degrees counter-clockwise.
         flip: Override for SectionFlip, as the letters x/y/z.
         spacing: Override for the histology (x, y, z) spacing in mm.
+        histo_root: Root of the cleanslide derivative; see resolve_section.
     Returns:
         Dict with sitk images "Ih_hr" (HR histology), "Mh_hr" (HR histology mask), "Im"
         (MRI), "Mm" (MRI mask) and "Ih_rgb_hr" (RGB histology, or None if no file exists),
@@ -720,7 +729,7 @@ def load_section(bids_root, subject, sample, stain=None, *,
         FileNotFoundError: If a required file is missing.
         ValueError: If a sidecar field or an override is malformed.
     """
-    paths = resolve_section(bids_root, subject, sample, stain)
+    paths = resolve_section(bids_root, subject, sample, stain, histo_root)
 
     metadata = read_section_metadata(paths["section_sidecar"])
     orientation = metadata["orientation"] if orientation is None else orientation

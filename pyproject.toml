@@ -42,6 +42,8 @@ Source = "https://github.com/spittayapong/histo2mri"
 
 [project.optional-dependencies]
 test = ["pytest>=7.0"]
+# Only needed for --cleanslide (clean raw histology before registering it).
+cleanslide = ["cleanslide @ git+https://github.com/spittayapong/cleanslide.git@v0.2.0"]
 # Only needed to use the environment as a Jupyter kernel for the demo notebook.
 dev = ["ipykernel>=6.0"]
 

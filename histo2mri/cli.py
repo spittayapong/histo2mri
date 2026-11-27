@@ -16,6 +16,12 @@ pipeline.register_section and writes that section's outputs to
 dataset_description.json is written at its root, and a run summary TSV records one row per
 section.
 
+With --cleanslide, either subcommand first cleans raw histology with the cleanslide package
+(histo2mri.clean) and then registers the cleaned section: register takes the raw slide as
+--histo and writes the cleaned files and cleanslide's QC panels next to its outputs; bids reads
+the raw sections of the dataset and writes the cleanslide derivative to <output_dir>/cleanslide/,
+leaving the input dataset untouched.
+
 Console output: one status line per section. Warnings from the pipeline are shown; with
 --verbose, each pipeline step as it starts ("[k/N] name"), all log messages (including
 per-iteration progress) and progress bars are shown.
@@ -34,8 +40,9 @@ from datetime import datetime
 import pandas as pd
 import torch
 from . import __version__
+from .clean import clean_bids, clean_file, parse_background_threshold
 from .io import ORIENTATION_PERMUTE, find_sections, resolve_section, write_dataset_description
-from .pipeline import PROFILES, register_files, register_section
+from .pipeline import PROFILES, _histo_stem, register_files, register_section
 
 
 def _pipeline_options():
@@ -70,24 +77,52 @@ def _pipeline_options():
     return p
 
 
+def _threshold_arg(text):
+    try:
+        return parse_background_threshold(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
+def _cleaning_options():
+    """Parent parser with the optional cleanslide step both subcommands share."""
+    p = argparse.ArgumentParser(add_help=False)
+    g = p.add_argument_group("cleaning raw histology first (needs the cleanslide package)")
+    g.add_argument("--cleanslide", action="store_true",
+                   help="clean the raw histology with cleanslide (artifact removal and tissue "
+                        "masking) before registering it; cleanslide's QC panels are written too")
+    g.add_argument("--cleanslide-background-threshold", type=_threshold_arg, default=None,
+                   metavar="N|auto",
+                   help="grey level (0-255) above which a pixel is slide, or 'auto' to estimate "
+                        "it per section. bids: overrides each sidecar's BackgroundThreshold; "
+                        "default: the sidecar's value, else cleanslide's default (240)")
+    return p
+
+
 def build_arg_parser():
     """Build the argument parser."""
     common = _pipeline_options()
+    cleaning = _cleaning_options()
     p = argparse.ArgumentParser(
         prog="histo2mri", description="Register 2D histology sections to their MRI volume")
     p.add_argument("--version", action="version", version=f"histo2mri {__version__}")
     sub = p.add_subparsers(dest="command", required=True, metavar="{register,bids}")
 
-    r = sub.add_parser("register", parents=[common],
+    r = sub.add_parser("register", parents=[common, cleaning],
                        help="register one section given as explicit files",
                        description="Register one histology section given as explicit files.")
     g = r.add_argument_group("inputs and output")
-    g.add_argument("--histo", required=True, help="gray histology image (e.g. 2D TIFF)")
-    g.add_argument("--histo-mask", required=True, help="tissue mask on the histology grid")
+    g.add_argument("--histo", required=True,
+                   help="cleaned gray histology image (e.g. 2D TIFF); with --cleanslide, the raw "
+                        "RGB slide (.tif, .tiff or .png)")
+    g.add_argument("--histo-mask", default=None,
+                   help="tissue mask on the histology grid; required unless --cleanslide, which "
+                        "makes it")
     g.add_argument("--mri", required=True, help="MRI volume with its geometry in the header (e.g. .nii.gz)")
     g.add_argument("--mri-mask", required=True, help="brain mask on the MRI grid")
     g.add_argument("--histo-rgb", default=None,
-                   help="optional RGB histology on the histology grid, used only for QC figures")
+                   help="optional RGB histology on the histology grid, used only for QC figures "
+                        "(made by --cleanslide)")
     g.add_argument("-o", "--output", required=True, metavar="OUT/PREFIX",
                    help="output prefix: files are written as OUT/PREFIX_*. A path ending in '/' "
                         "uses the histology file name as the prefix.")
@@ -103,7 +138,7 @@ def build_arg_parser():
                    help="axes to mirror after the rotation: letters from x/y ('y' = top-bottom, "
                         "'x' = left-right); default none")
 
-    b = sub.add_parser("bids", parents=[common],
+    b = sub.add_parser("bids", parents=[common, cleaning],
                        help="register the sections of a BIDS dataset (BIDS App)",
                        description="Register the histology sections of a BIDS dataset.")
     b.add_argument("bids_dir", help="BIDS dataset to read")
@@ -166,19 +201,39 @@ def _split_output(output):
 
 
 def run_register(args):
-    """Run one section given as files; return the exit status (0 ok, 1 failed)."""
+    """Run one section given as files; return the exit status (0 ok, 1 failed).
+
+    With --cleanslide, --histo is the raw slide: it is cleaned first (clean.clean_file) and
+    the cleaned image, mask and RGB image, written next to the outputs, are registered.
+    """
     if len(args.histo_pixel_size) > 2:
         raise SystemExit("--histo-pixel-size takes one value, or two (X Y)")
+    if args.cleanslide and (args.histo_mask or args.histo_rgb):
+        raise SystemExit("--cleanslide makes the mask and RGB image from the raw --histo; "
+                         "leave out --histo-mask and --histo-rgb")
+    if not args.cleanslide and not args.histo_mask:
+        raise SystemExit("--histo-mask is required unless --cleanslide is given")
+    if args.cleanslide_background_threshold is not None and not args.cleanslide:
+        raise SystemExit("--cleanslide-background-threshold only applies with --cleanslide")
+
     out_dir, prefix = _split_output(args.output)
-    label = prefix or os.path.basename(args.histo)
-    print(f"{label} ... RUNNING", flush=True)
+    section_id = prefix or _histo_stem(args.histo)
+    print(f"{section_id} ... RUNNING", flush=True)
     start = time.perf_counter()
+    label = section_id
     try:
+        histo, histo_mask, histo_rgb, crop = args.histo, args.histo_mask, args.histo_rgb, None
+        if args.cleanslide:
+            cleaned = clean_file(args.histo, args.histo_pixel_size, out_dir, section_id,
+                                 background_threshold=args.cleanslide_background_threshold)
+            histo, histo_mask, histo_rgb = cleaned["histo_gray"], cleaned["histo_mask"], cleaned["histo_rgb"]
+            crop = cleaned["crop"]
+            print(f"{section_id} ... cleaned with cleanslide (QC: {cleaned['qc_stages']})", flush=True)
         info = register_files(
-            args.histo, args.histo_mask, args.mri, args.mri_mask, out_dir,
+            histo, histo_mask, args.mri, args.mri_mask, out_dir,
             orientation=args.orientation, pixel_size_um=args.histo_pixel_size,
-            rotation=args.rotation, flip=args.flip, histo_rgb=args.histo_rgb,
-            section_id=prefix, **_pipeline_kwargs(args),
+            rotation=args.rotation, flip=args.flip, histo_rgb=histo_rgb, crop=crop,
+            section_id=section_id, **_pipeline_kwargs(args),
         )
     except Exception as e:
         print(f"{label} ... FAILED ({type(e).__name__}: {e}, "
@@ -190,7 +245,7 @@ def run_register(args):
     return 0
 
 
-def _select_sections(args):
+def _select_sections(args, histo_root=None):
     """List the sections to run: what the dataset holds, narrowed by the label options.
 
     Each option takes several labels, so the selection is the union over them; an option
@@ -205,7 +260,7 @@ def _select_sections(args):
     for subject in args.participant_label or [None]:
         for sample in args.sample_label or [None]:
             for stain in args.stain_label or [None]:
-                for section in find_sections(args.bids_dir, subject, sample, stain):
+                for section in find_sections(args.bids_dir, subject, sample, stain, histo_root):
                     if section["base"] not in seen:
                         seen.add(section["base"])
                         selected.append(section)
@@ -233,20 +288,40 @@ def run_bids(args):
     profile, and either the values returned by register_section (output_npz,
     n_clean_matches, best_scale, elapsed_sec) or error and elapsed_sec.
 
+    With --cleanslide, the raw sections selected by the label options are first cleaned into
+    <output_dir>/cleanslide/ (clean.clean_bids), and only the sections cleaned in this run
+    are registered, from there; a section whose cleaning failed gets an "error" row.
+
     Returns:
         0; failed sections are recorded in the summary rather than in the exit status.
     """
     kwargs = _pipeline_kwargs(args)
-    sections = _select_sections(args)
-    if args.limit is not None:
-        sections = sections[: args.limit]
-
     write_dataset_description(args.output_dir, __version__)
     summary_path = args.summary or os.path.join(
         args.output_dir, f"run_log_{datetime.now():%Y%m%d_%H%M%S}.tsv")
 
+    histo_root, results = None, []
+    if args.cleanslide:
+        histo_root = os.path.join(args.output_dir, "cleanslide")
+        cleaned = clean_bids(args.bids_dir, histo_root,
+                             participant_labels=args.participant_label,
+                             sample_labels=args.sample_label, stain_labels=args.stain_label,
+                             background_threshold=args.cleanslide_background_threshold,
+                             progress=lambda line: print(line, flush=True))
+        cleaned_ok = {c["name"] for c in cleaned if c["status"] == "ok"}
+        results = [{"subject": c["subject"], "sample": c["sample"], "stain": c["stain"],
+                    "section_id": c["name"], "profile": args.profile, "status": "error",
+                    "error": c["error"]} for c in cleaned if c["status"] != "ok"]
+        sections = (_select_sections(args, histo_root) if cleaned_ok else [])
+        sections = [s for s in sections if s["base"] in cleaned_ok]
+    else:
+        sections = _select_sections(args)
+    if args.limit is not None:
+        sections = sections[: args.limit]
+    if results:
+        pd.DataFrame(results).to_csv(summary_path, sep="\t", index=False, na_rep="n/a")
+
     total = len(sections)
-    results = []
     for i, section in enumerate(sections, start=1):
         entry = {k: section[k] for k in ("subject", "sample", "stain")}
         entry["profile"] = args.profile
@@ -255,7 +330,7 @@ def run_bids(args):
             # Resolved here as well as in register_section, so that a missing or ambiguous
             # section is reported against this row rather than aborting the batch.
             paths = resolve_section(args.bids_dir, section["subject"], section["sample"],
-                                    section["stain"])
+                                    section["stain"], histo_root)
             section_id = paths["base"]
             entry["section_id"] = section_id
             print(f"[{i}/{total}] {section_id} ... RUNNING", flush=True)
@@ -266,7 +341,7 @@ def run_bids(args):
 
             info = register_section(
                 args.bids_dir, section["subject"], section["sample"], out_dir,
-                stain=section["stain"], **kwargs,
+                stain=section["stain"], histo_root=histo_root, **kwargs,
             )
             entry.update(status="ok", **info)
             print(f"[{i}/{total}] " + _done_line(section_id, args.profile, info), flush=True)
