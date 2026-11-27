@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 import os
 import torch
 import math
+import contextlib
 from matplotlib.path import Path
 from scipy.spatial import ConvexHull
 from .canvas import _to_zyx_volume, fit_plane_z_ax_by_c
@@ -30,9 +31,23 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+_display_figures = True
+
+
+@contextlib.contextmanager
+def figures_hidden():
+    """Within the block, figures are still saved but not displayed."""
+    global _display_figures
+    previous, _display_figures = _display_figures, False
+    try:
+        yield
+    finally:
+        _display_figures = previous
+
+
 def _show():
     """Show the current figures when the Matplotlib backend can display them (not under Agg)."""
-    if matplotlib.get_backend().lower() != "agg":
+    if _display_figures and matplotlib.get_backend().lower() != "agg":
         plt.show()
 
 
@@ -932,6 +947,7 @@ def plot_histology_in_mri_space(
     mri_size,
     save_file=None,
     max_points=20000,
+    histo_rgb_on_surface=None,
 ):
     """Show where the section sits inside the MRI: the sheet in 3D, and the slices it cuts.
 
@@ -939,7 +955,11 @@ def plot_histology_in_mri_space(
     positions, coloured by the histology sampled on it, inside the volume's bounding box:
     this is the histology placed in MRI space, and the same geometry a 3D viewer would be
     given. The other three show the MRI slice nearest the sheet's centre along each axis,
-    with the sheet's intersection drawn on it, so the cut can be read against the anatomy.
+    with the sheet drawn on it in the same histology colours, so the cut can be read against
+    the anatomy. The x slice is rotated 90 degrees clockwise so that y, the viewer's "down"
+    axis, runs vertically as in the other two slices; its horizontal axis is then z reversed.
+    The histology colours are the RGB image when histo_rgb_on_surface is given, otherwise
+    histo_on_surface through a viridis map.
 
     Positions are MRI voxel indices of the orientation-permuted volume, the frame
     xyz_norm_final is stored in. Converting to millimetres needs that volume's origin,
@@ -953,6 +973,8 @@ def plot_histology_in_mri_space(
         mri_size: (X, Y, Z) size of the permuted MRI, to undo the normalisation.
         save_file: Path to write the figure to; not saved when None.
         max_points: Upper bound on plotted sheet points; the cloud is thinned to it.
+        histo_rgb_on_surface: Optional (Hc, Wc, 3) RGB histology on the canvas, 0-1 or
+            0-255 (inverse.sample_rgb_on_surface); colours the sheet when given.
     """
     valid = np.asarray(valid_surf).astype(bool)
     if not valid.any():
@@ -961,45 +983,53 @@ def plot_histology_in_mri_space(
 
     size = np.asarray(mri_size, dtype=float)
     xyz = np.asarray(xyz_norm_final, dtype=float)[valid] * (size - 1)   # [N, 3] in (x, y, z)
-    colour = np.asarray(histo_on_surface, dtype=float)[valid]
+    if histo_rgb_on_surface is not None:
+        colour = np.asarray(histo_rgb_on_surface, dtype=float)[valid][:, :3]
+        if colour.max(initial=0.0) > 1.0:
+            colour = colour / 255.0
+        colour = np.clip(colour, 0, 1)
+    else:
+        grey = np.asarray(histo_on_surface, dtype=float)[valid]
+        lo, hi = np.percentile(grey, [1, 99])
+        # A sequential colour map rather than gray: most of a section is dark, and dark grey
+        # on a white 3D panel or a grey MRI slice is unreadable.
+        colour = plt.cm.viridis(np.clip((grey - lo) / (hi - lo + 1e-8), 0, 1))[:, :3]
 
     # Thin by a stride rather than at random, so the figure is the same on every run.
     if len(xyz) > max_points:
         step = int(np.ceil(len(xyz) / max_points))
         xyz, colour = xyz[::step], colour[::step]
 
-    lo, hi = np.percentile(colour, [1, 99])
-    colour_norm = np.clip((colour - lo) / (hi - lo + 1e-8), 0, 1)
-
     fig = plt.figure(figsize=(21, 5.6))
     ax3d = fig.add_subplot(1, 4, 1, projection='3d')
-    # A sequential colour map rather than gray: most of a section is dark, and dark grey on
-    # a white 3D panel is unreadable. The axes keep the volume's proportions, so the sheet's
-    # tilt and its position in the volume are both honest.
-    ax3d.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c=colour_norm, cmap='viridis',
-                 s=3.0, linewidths=0, vmin=0, vmax=1, depthshade=False)
+    # The axes keep the volume's proportions, so the sheet's tilt and its position in the
+    # volume are both honest.
+    ax3d.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c=colour,
+                 s=3.0, linewidths=0, depthshade=False)
     ax3d.set_xlim(0, size[0]); ax3d.set_ylim(0, size[1]); ax3d.set_zlim(0, size[2])
     ax3d.set_box_aspect(size)
     ax3d.view_init(elev=22, azim=-60)
     ax3d.set_xlabel('x'); ax3d.set_ylabel('y'); ax3d.set_zlabel('z')
     ax3d.set_title('histology on the sheet, in MRI voxel space')
 
-    # One slice per axis, taken where the sheet is centred along that axis. take() indexes
-    # the (Z, Y, X) volume; the rows and columns of what it returns are the two axes that
-    # were not sliced, and u/v are given in that same order.
+    # One slice per axis, taken where the sheet is centred along that axis. take() returns
+    # the displayed image, and u/v are the sheet positions as its columns and rows. The x
+    # slice vol[:, :, i] is (Z, Y); rot90(k=-1) makes it (Y, Z reversed), so y is vertical.
     vol = np.asarray(mri_zyx)
+    n_z = vol.shape[0]
     centre = np.round(xyz.mean(axis=0)).astype(int)                     # (x, y, z)
     panels = (
-        ('x', 0, lambda i: vol[:, :, i], (xyz[:, 1], xyz[:, 2]), ('y', 'z')),
-        ('y', 1, lambda i: vol[:, i, :], (xyz[:, 0], xyz[:, 2]), ('x', 'z')),
-        ('z', 2, lambda i: vol[i, :, :], (xyz[:, 0], xyz[:, 1]), ('x', 'y')),
+        ('x', 0, lambda i: np.rot90(vol[:, :, i], k=-1), (n_z - 1 - xyz[:, 2], xyz[:, 1]),
+         ('z (reversed)', 'y'), ', rotated 90 deg'),
+        ('y', 1, lambda i: vol[:, i, :], (xyz[:, 0], xyz[:, 2]), ('x', 'z'), ''),
+        ('z', 2, lambda i: vol[i, :, :], (xyz[:, 0], xyz[:, 1]), ('x', 'y'), ''),
     )
-    for panel, (axis_name, axis, take, (u, v), (u_name, v_name)) in enumerate(panels, start=2):
+    for panel, (axis_name, axis, take, (u, v), (u_name, v_name), note) in enumerate(panels, start=2):
         index = int(np.clip(centre[axis], 0, vol.shape[2 - axis] - 1))
         ax = fig.add_subplot(1, 4, panel)
         ax.imshow(take(index), cmap='gray')
-        ax.scatter(u, v, s=0.3, c='tab:orange', linewidths=0)
-        ax.set_title(f'MRI {axis_name} = {index}, sheet on it')
+        ax.scatter(u, v, s=1.0, c=colour, linewidths=0)
+        ax.set_title(f'MRI {axis_name} = {index}, sheet on it{note}')
         ax.set_xlabel(u_name); ax.set_ylabel(v_name)
         ax.set_xticks([]); ax.set_yticks([])
 

@@ -15,14 +15,14 @@ import numpy as np
 import SimpleITK as sitk
 import torch
 from .canvas import create_common_canvas, extract_roi_plane
-from .inverse import build_hr_common_affines, mri_on_histology_space
+from .inverse import build_hr_common_affines, mri_on_histology_space, sample_rgb_on_surface
 from .io import load_section, resolve_section
 from .matching import match_patches, rescale_histology, search_patch_config, search_scale
 from .outliers import filter_outliers
 from .plane import fit_global_plane, matches_to_common_canvas
 from .preprocessing import prepare_histology, prepare_mri_slab, resample_histo_to_mri
-from .qc import (plot_histology_in_mri_space, plot_mri_on_histology_rgb, plot_mri_on_sheet, plot_roi_support,
-                 show_matched_pairs, visualize_roi_from_matches)
+from .qc import (figures_hidden, plot_histology_in_mri_space, plot_mri_on_histology_rgb, plot_mri_on_sheet,
+                 plot_roi_support, show_matched_pairs, visualize_roi_from_matches)
 from .refine import prepare_coords_from_G_canvas, refine_curved_sheet, sheet_folding_pct, tps_sheet_xyz_norm
 from .tps import (InplaneScaledResidual, ResidualToGSurface3D, fit_residual_tps2d, fit_residual_tps3d,
                   fit_tps_robust, resample_histology_on_surface)
@@ -68,16 +68,11 @@ MATCHER_SETTINGS = dict(
 
 # NGF fusion weight of the fine matcher only, so its score is
 # (0.6*HOG + 0.4*MIND + 0.2*NGF) / 1.2. Not part of MATCHER_SETTINGS, because the cached
-# HOG+MIND matcher used by the scale and patch-config searches has no NGF term. Without NGF,
-# mean TRE on 37 myelin sections got worse (1.91 -> 1.99 mm) and the surface folded more.
+# HOG+MIND matcher used by the scale and patch-config searches has no NGF term.
 FINE_MATCH_W_NGF = 0.2
 
 # Half-width of the fine-matching z window around z_center, in mm; converted to slices with
-# the slab's slice spacing. It is a tilt allowance: about 26 deg of section tilt for a typical
-# section, 16 deg for the largest ones. The coarse z band of search_patch_config is not used,
-# because it only reflects the spread of a few coarse matches (often its 8-slice minimum),
-# while the section's tilt makes the final sheet reach well beyond it. 24 mm equals the former
-# fixed 60 slices at 0.4 mm MRI and gives 64 slices at 0.375 mm.
+# the slab's slice spacing.
 FINE_MATCH_Z_HALF_MM = 24.0
 
 # Fold fix. Where neighbouring matches disagree, the in-plane part of the 3D residual TPS can
@@ -93,6 +88,38 @@ logger = logging.getLogger(__name__)
 def _to_np(x):
     """Return x as a numpy array (torch tensors are detached and moved to the CPU)."""
     return x.detach().cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
+
+
+# Steps of _register, in order; with verbose=True each is printed as it starts.
+_STEPS = (
+    "Load the section and its MRI",
+    "Histology to MRI spacing",
+    "Prepare the histology",
+    "Prepare the MRI slab",
+    "Find ROI: histology scale",
+    "Find ROI: patch size, strides and z centre",
+    "Fine patch matching",
+    "Outlier filtering",
+    "ROI plane",
+    "Common canvas",
+    "Global in-plane transform G",
+    "Robust TPS",
+    "Residual TPS on top of G",
+    "Histology on the initial surface",
+    "Fold check of the initial sheet",
+    "Curved-sheet refinement",
+    "QC figures in MRI space",
+    "Back to HR histology space",
+    "Save the transform",
+)
+
+
+def _progress(name, verbose):
+    """Log the step that is starting, and print it as "[k/N] name" when verbose."""
+    k = _STEPS.index(name) + 1
+    logger.info(f"Step {k}/{len(_STEPS)}: {name}")
+    if verbose:
+        print(f"[{k}/{len(_STEPS)}] {name}", flush=True)
 
 
 @contextlib.contextmanager
@@ -153,7 +180,7 @@ def register_section(bids_root, subject, sample, out_dir, *, stain=None,
         device: torch device (or string) for matching, TPS fitting and refinement; defaults
             to "cuda:0" when CUDA is available, otherwise "cpu".
         ransac_sample_size: Minimal sample size of the RANSAC TPS fit (the command line
-            uses 3 for NextBrain sections and 5 otherwise).
+            uses 3 for sparse sections and 5 otherwise).
         pad_multiple: The prepared histology is padded to a multiple of this (pixels). The
             matching patch sizes themselves are searched (96 and 64 px).
         pclip: (low, high) percentiles for the MRI intensity normalisation.
@@ -170,7 +197,10 @@ def register_section(bids_root, subject, sample, out_dir, *, stain=None,
             is added automatically.
         save_roi_qc: Also save the three ROI QC figures (matched patch pairs, 3D view of the
             matches, hull support on histology and ROI plane).
-        verbose: Log extra detail of the MRI-on-histology step.
+        verbose: When True, print each step as it starts ("[k/N] name"), display the QC
+            figures where the Matplotlib backend can, and print extra detail of the
+            MRI-on-histology step. When False, nothing is printed or displayed; the steps
+            still go to the log and the figures are still saved.
 
     Files written to out_dir (prefix <sub-X>_<sample-Y>_<stain-Z>):
         _process.log: Log of this section (overwritten on each call).
@@ -249,7 +279,7 @@ def register_section(bids_root, subject, sample, out_dir, *, stain=None,
     # Resolved before the log is opened, because the log file is named after the section.
     section_id = resolve_section(bids_root, subject, sample, stain)["base"]
     log_path = os.path.join(out_dir, f"{section_id}_process.log")
-    with _section_log(log_path):
+    with _section_log(log_path), (contextlib.nullcontext() if verbose else figures_hidden()):
         return _register(
             bids_root, subject, sample, stain, section_id, out_dir,
             profile=profile, device=device, ransac_sample_size=ransac_sample_size,
@@ -270,6 +300,7 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
     section_start = time.perf_counter()
 
     # ---- Load ----
+    _progress("Load the section and its MRI", verbose)
     vols = load_section(bids_root, subject, sample, stain)
     Ih_hr, Mh_hr, Im, Mm = vols["Ih_hr"], vols["Mh_hr"], vols["Im"], vols["Mm"]
     Ih_rgb_hr = vols.get("Ih_rgb_hr")
@@ -279,9 +310,11 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
                 f"spacing {tuple(round(v, 5) for v in vols['spacing'])} mm")
 
     # ---- Resample histology to MRI spacing (HR -> LR) ----
+    _progress("Histology to MRI spacing", verbose)
     Ih, Mh, A_hr_to_lr = resample_histo_to_mri(Ih_hr=Ih_hr, Mh_hr=Mh_hr, Im=Im)
 
     # ---- Prepare histology (LR -> proc: pad to a multiple of pad_multiple) ----
+    _progress("Prepare the histology", verbose)
     # scale_ratio (1, 1): no resizing here; the shrinkage scale is searched below.
     scale_ratio = (1, 1)
     proc_Ih, proc_Mh, A_lr_to_proc = prepare_histology(
@@ -292,6 +325,7 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
     logger.info(f"Prepared histology - proc_Ih size:{proc_Ih.GetSize()}")
 
     # ---- Prepare MRI (dilated mask, robust intensity normalisation) ----
+    _progress("Prepare the MRI slab", verbose)
     # n_slices is only the slice index of the optional preparation display.
     n_slices = Im.GetSize()[2] // 2
     _, slab_Im, slab_Mm = prepare_mri_slab(
@@ -300,6 +334,7 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
     logger.info(f"Prepared MRI slab - slab_Im size:{slab_Im.GetSize()}")
 
     # ---- Find ROI: best histology scale (shrinkage compensation) ----
+    _progress("Find ROI: histology scale", verbose)
     scales = np.arange(1.00, scale_max + 1e-6, scale_step)
     best_scale_info, _ = search_scale(
         proc_Ih=proc_Ih, histo_mask=proc_Mh, slab_Im=slab_Im, slab_Mm=slab_Mm,
@@ -309,6 +344,7 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
     logger.info(f"Best scale: {best_scale} score:{best_scale_info['score']}")
 
     # ---- Find ROI: best patch size / strides and z band ----
+    _progress("Find ROI: patch size, strides and z centre", verbose)
     # Candidate configurations (patch size and strides in pixels/voxels).
     patch_matrix = [
         {"patch": 96, "hist_stride": 64, "mri_stride": 8},
@@ -323,6 +359,7 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
                  f"z_center:{z_center}")
 
     # ---- Fine matching (proc -> scaled histology), restricted to z_center +/- FINE_MATCH_Z_HALF_MM ----
+    _progress("Fine patch matching", verbose)
     scaled_proc_Ih, scaled_proc_Mh = rescale_histology(proc_Ih, proc_Mh, best_scale)
 
     # The z band returned by search_patch_config is replaced by a fixed window in mm.
@@ -344,6 +381,7 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
     )
 
     # ---- Outlier filtering ----
+    _progress("Outlier filtering", verbose)
     clean_matches, coarse_matches, pts_clean, sc_clean = filter_outliers(
         all_matches=all_matches["matches"], z_min=z_min, z_max=z_max,
         plane_dist_thresh=settings["outlier_plane_dist"], knn_params=settings["outlier_knn"],
@@ -351,6 +389,7 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
     logger.info(f"Fine matching - clean_matches:{len(clean_matches)}")
 
     # ---- ROI plane ----
+    _progress("ROI plane", verbose)
     # extract_roi_plane is required, not only QC: plane_img (MRI sampled on a plane through the
     # clean matches) sets the common canvas, and its origin x0/y0 (MRI voxels) sets G's (u, v) frame.
     plane_img, x0, x1, y0, y1 = extract_roi_plane(clean_matches, pts_clean, slab_Im, device)
@@ -359,12 +398,14 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
                      slab_Im, scaled_proc_Ih, plane_img, x0, y0, z_min, z_max)
 
     # ---- Common canvas ----
+    _progress("Common canvas", verbose)
     Hc, Wc, oy_h, ox_h, oy_m, ox_m, hist_common, mri_common, mask_common = create_common_canvas(
         scaled_proc_Ih, scaled_proc_Mh, plane_img
     )
     logger.info(f"Common canvas - hist_common:{hist_common.shape}")
 
     # ---- Global in-plane transform G ----
+    _progress("Global in-plane transform G", verbose)
     # MRI x/y range covered by the whole common canvas (1 canvas pixel = 1 MRI voxel), so that
     # G's (u, v) equal canvas (column, row).
     step = 1.0
@@ -392,6 +433,7 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
     proc_Mh_common_sitk = sitk.GetImageFromArray(proc_Mh_common_arr)
 
     # ---- Initial surface: robust TPS fit (RANSAC, then MAD) ----
+    _progress("Robust TPS", verbose)
     # Adaptive RANSAC inlier threshold: fit a TPS with MAD rejection, take the residuals of all
     # matches (MRI voxels), and use median + 3 * 1.4826 * MAD, clipped to [3, 20] voxels.
     _tps_diag, _, _, _, _resid_diag, _ = fit_tps_robust(
@@ -455,6 +497,7 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
     logger.info(f"Init DDF - in-plane filter: kept {int(_keep.sum())}/{len(_keep)} (max in-plane {_inp.max():.1f} vox)")
 
     # ---- Residual TPS on top of G ----
+    _progress("Residual TPS on top of G", verbose)
     # 3D: MRI xyz offset from G(u, v); 2D: histology xy offset from G's similarity. Both add
     # zero-residual anchors on a grid far from the matches, so the surface falls back to G there.
     tps3d_res, uv_all_3d, dxyz_all, uv_anchor_3d = fit_residual_tps3d(
@@ -476,6 +519,7 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
     logger.info(f"Init DDF - per-section clamp_vox={clamp_vox:.2f} (kept |dxyz| max={_mag.max():.1f} vox)")
 
     # ---- Resample histology onto the surface (common canvas) ----
+    _progress("Histology on the initial surface", verbose)
     # xy_map_sym: (Hc, Wc, 2) histology (x, y) looked up for each canvas pixel; valid_hist marks
     # lookups inside the histology image.
     hist_on_init_tps, valid_hist, uv_map_sym, xy_map_sym, conf_hist, dmin_hist = resample_histology_on_surface(
@@ -492,6 +536,7 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
     logger.info("Initial TPS on top of G fitted")
 
     # ---- Fold check of the initial sheet (see FOLD_FIX_INPLANE_SCALES) ----
+    _progress("Fold check of the initial sheet", verbose)
     # The sheet the refinement starts from (tps_sheet_xyz_norm, before its B-spline warm
     # start), evaluated on the canvas nodes that lie inside the MRI and the histology mask.
     dims_xyz = slab_Im.GetSize()
@@ -517,6 +562,7 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
                     f"in-plane residual x{inplane_scale:g}: {fold_shrunk:.3f}%")
 
     # ---- Curved-sheet refinement ----
+    _progress("Curved-sheet refinement", verbose)
     # Initial surface = G + 3D residual TPS (absolute MRI voxel xyz). The refinement deforms the
     # sheet so that the MRI sampled on it matches hist_on_init_tps.
     def _refine(residual):
@@ -548,6 +594,7 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
     logger.info("Refined curved sheet")
 
     # ---- QC figures in MRI (sheet) space ----
+    _progress("QC figures in MRI space", verbose)
     # Valid canvas pixels: sheet inside the MRI, histology lookup inside the image and the mask.
     valid_display = valid_mri & valid_hist & hist_mask_on_init_tps
     plot_mri_on_sheet(
@@ -562,19 +609,24 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
         hist_on_init_tps=hist_on_init_tps, valid_display=valid_display,
     )
 
-    # Where the section sits in the volume, rather than flattened on the canvas.
+    # ---- Map back to HR histology (affine chain HR <-> common canvas) and QC ----
+    _progress("Back to HR histology space", verbose)
+    A_hr_to_common, A_common_to_hr = build_hr_common_affines(
+        proc_Ih, scaled_proc_Ih, A_hr_to_proc, oy_h, ox_h
+    )
+    logger.info("Composed A_common_to_hr")
+
+    # Where the section sits in the volume, rather than flattened on the canvas; coloured
+    # with the RGB histology when there is one.
+    histo_rgb_on_surface = (None if Ih_rgb_hr is None else
+                            sample_rgb_on_surface(Ih_rgb_hr, xy_map_sym, A_common_to_hr))
     plot_histology_in_mri_space(
         xyz_norm_final=_to_np(xyz_norm_final), valid_surf=_to_np(valid_display),
         histo_on_surface=_to_np(hist_on_init_tps),
         mri_zyx=sitk.GetArrayFromImage(slab_Im), mri_size=slab_Im.GetSize(),
         save_file=os.path.join(out_dir, f"{section_id}_histo_in_mri_volume.png"),
+        histo_rgb_on_surface=histo_rgb_on_surface,
     )
-
-    # ---- Map back to HR histology (affine chain HR <-> common canvas) and QC ----
-    A_hr_to_common, A_common_to_hr = build_hr_common_affines(
-        proc_Ih, scaled_proc_Ih, A_hr_to_proc, oy_h, ox_h
-    )
-    logger.info("Composed A_common_to_hr")
 
     _save_mri_on_histo_space(
         section_id=section_id, out_dir=out_dir,
@@ -587,6 +639,7 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
     )
 
     # ---- Save the transform (keys and frames: see the docstring) ----
+    _progress("Save the transform", verbose)
     save_path = os.path.join(out_dir, f"{section_id}_transform_grid.npz")
     np.savez_compressed(
         save_path,

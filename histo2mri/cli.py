@@ -6,11 +6,11 @@ The dataset is the list of what there is to process: main() takes the sections i
 narrowed by the label options, and for each one calls pipeline.register_section and writes
 that section's outputs to <output_dir>/<sub-X>/<sub-X_sample-Y_stain-Z>/. The output folder
 is a BIDS derivative, so a dataset_description.json is written at its root, and a run summary
-TSV records one row per section. Matplotlib is switched to the non-interactive Agg backend
-on import.
+TSV records one row per section.
 
 Console output: one status line per section. Warnings from the pipeline are shown; with
---verbose, all log messages (including per-iteration progress) and progress bars are shown.
+--verbose, each pipeline step as it starts ("[k/N] name"), all log messages (including
+per-iteration progress) and progress bars are shown.
 Each section's own log file always contains the INFO-level messages.
 """
 import matplotlib
@@ -30,9 +30,9 @@ from .pipeline import PROFILES, register_section
 
 
 def build_arg_parser():
-    """Build the argument parser of the BIDS App."""
+    """Build the argument parser."""
     p = argparse.ArgumentParser(
-        description="Register 2D histology sections of a BIDS dataset to their MRI volume")
+        description="Register 2D histology sections to their MRI volume")
     p.add_argument("bids_dir", help="BIDS dataset to read")
     p.add_argument("output_dir", help="where the derivative is written")
     p.add_argument("analysis_level", choices=["participant"],
@@ -49,7 +49,7 @@ def build_arg_parser():
                          "whole run. Use he-cblock only for H&E cerebellum-block sections.")
     p.add_argument("--ransac-sample-size", type=int, default=5,
                     help="Matches per RANSAC TPS hypothesis. Sections that yield few matches "
-                         "(NextBrain blocks) need 3; this will be derived from the match count later.")
+                         "sparse section need 3; this will be derived from the match count later.")
     p.add_argument("--pad-multiple", type=int, default=64,
                     help="The histology is padded to a multiple of this (px).")
     p.add_argument("--pclip", nargs=2, type=float, default=(1, 99), metavar=("LOW", "HIGH"),
@@ -58,8 +58,7 @@ def build_arg_parser():
     p.add_argument("--scale-step", type=float, default=0.05, help="Step of the histology scale search.")
     p.add_argument("--device", default=None, help="cuda:0 / cpu; auto-detect if omitted")
     p.add_argument("--mri-on-histo-tile-size", type=int, default=348,
-                    help="Checkerboard tile size (px) for the mri_on_histo overlay. "
-                         "Use e.g. 2048 for 4 um histology.")
+                    help="Checkerboard tile size (px) for the mri_on_histo overlay. ")
     p.add_argument("--lam-area", type=float, default=2.0,
                     help="Local rigidity: weight on log(area/area0)^2 (properness). 0 disables rigidity.")
     p.add_argument("--lam-shape", type=float, default=0.0,
@@ -67,7 +66,7 @@ def build_arg_parser():
     p.add_argument("--w-rigid-mode", default="mask", choices=["mask", "conf", "edge", "none"],
                     help="Spatial rigidity weight map used by the refinement.")
     p.add_argument("--save-roi-qc", action="store_true",
-                    help="Also save the three ROI QC figures per section.")
+                    help="Also save the ROI QC figures per section.")
     p.add_argument("--limit", type=int, default=None, help="Only process the first N sections (dry-run)")
     p.add_argument("--summary", default=None,
                     help="Run summary path; defaults to <output_dir>/run_log_<timestamp>.tsv")

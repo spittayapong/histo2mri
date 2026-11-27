@@ -296,6 +296,48 @@ def build_hr_common_affines(proc_Ih, scaled_proc_Ih, A_hr_to_proc, oy_h, ox_h):
     return A_hr_to_common, A_common_to_hr
 
 
+def sample_rgb_on_surface(Ih_rgb_hr, xy_map_sym, A_common_to_hr):
+    """Colour each surface pixel with the HR RGB histology at its histology position.
+
+    Surface pixel -> common-canvas (x, y) via xy_map_sym -> HR pixel via
+    A_common_to_hr, read with nearest-neighbour lookup. Positions outside the HR
+    image take the colour of the nearest border pixel; mask them with the surface's
+    valid map.
+
+    Args:
+        Ih_rgb_hr: HR RGB histology, sitk.Image of size (W, H, 1) with 3 components,
+            or an array [H, W, 3]; 0-255 or 0-1.
+        xy_map_sym: [Hs, Ws, 2] common-canvas (x, y) of each surface pixel.
+        A_common_to_hr: 4x4 index affine from the common canvas to HR pixels.
+
+    Returns:
+        float32 array [Hs, Ws, 3] in [0, 1].
+    """
+    if isinstance(Ih_rgb_hr, sitk.Image):
+        rgb = sitk.GetArrayFromImage(Ih_rgb_hr)
+    else:
+        rgb = np.asarray(Ih_rgb_hr)
+    if rgb.ndim == 4 and rgb.shape[0] == 1:
+        rgb = rgb[0]
+    if rgb.ndim != 3 or rgb.shape[-1] < 3:
+        raise ValueError(f"Ih_rgb_hr must be [H, W, 3], got {rgb.shape}")
+    rgb = rgb[..., :3]
+
+    xy = xy_map_sym.detach().cpu().numpy() if torch.is_tensor(xy_map_sym) else np.asarray(xy_map_sym)
+    Hs, Ws = xy.shape[:2]
+    xy = xy.reshape(-1, 2).astype(np.float64)
+    p = np.stack([xy[:, 0], xy[:, 1], np.zeros(len(xy)), np.ones(len(xy))], axis=1)
+    q = p @ np.asarray(A_common_to_hr, dtype=np.float64).T
+    w = np.where(np.abs(q[:, 3]) > 1e-8, q[:, 3], 1.0)
+    col = np.clip(np.rint(np.nan_to_num(q[:, 0] / w)).astype(np.int64), 0, rgb.shape[1] - 1)
+    row = np.clip(np.rint(np.nan_to_num(q[:, 1] / w)).astype(np.int64), 0, rgb.shape[0] - 1)
+
+    out = rgb[row, col].astype(np.float32)
+    if out.max(initial=0.0) > 1.0:
+        out /= 255.0
+    return out.reshape(Hs, Ws, 3)
+
+
 def build_target_valid_mask(
     mri_on_final_sheet,
     xy_map_sym,
