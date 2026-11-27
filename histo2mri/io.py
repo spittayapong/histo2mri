@@ -1,6 +1,8 @@
-"""Load one histology section and its MRI volume from a BIDS dataset.
+"""Load one histology section and its MRI volume, from a BIDS dataset or from explicit files.
 
-First step of the pipeline (pipeline.register_section). Images are returned as SimpleITK
+First step of the pipeline: load_section (pipeline.register_section) finds the files and
+sidecar values in a BIDS dataset and hands them to load_files (pipeline.register_files),
+which takes them directly. Images are returned as SimpleITK
 images; arrays read from the histology TIFFs are promoted to numpy (z, y, x) order with a
 single slice, and geometry tuples are in sitk (x, y, z) order. The MRI axes are permuted so
 that the histology cutting plane lies in the x-y plane of the returned MRI (z is the slicing
@@ -565,44 +567,72 @@ def load_mri(path, orientation, pixel_type=None):
     return sitk.Flip(img, view_flips(img, orientation), flipAboutOrigin=False)
 
 
-def load_section(bids_root, subject, sample, stain=None, *,
-                 orientation=None, rotation=None, flip=None, spacing=None):
-    """Load one section's histology, its mask, the optional RGB histology, the MRI and its mask.
+def pixel_size_to_spacing(pixel_size_mm):
+    """Turn a histology pixel size into the (x, y, z) spacing load_slide takes.
 
-    The spacing and the three placement fields come from the sidecars unless they are passed
-    in, which lets a caller try another value without editing the dataset. The histology is
-    rotated and then flipped, in that order; the MRI and its mask are reoriented to LPS and
-    permuted for the cutting plane.
+    A section is one slice thick, so z takes the x size, as read_pixel_size_mm does.
 
     Args:
-        bids_root: Dataset root.
-        subject: Subject label, with or without the "sub-" prefix.
-        sample: Sample label, with or without the "sample-" prefix.
-        stain: Stain label; optional when subject and sample identify one section.
-        orientation: Override for SectionOrientation.
-        rotation: Override for SectionRotation, in degrees counter-clockwise.
-        flip: Override for SectionFlip, as the letters x/y/z.
-        spacing: Override for the histology (x, y, z) spacing in mm.
+        pixel_size_mm: One number (square pixels), (x, y), or a full (x, y, z), in mm.
     Returns:
-        Dict with sitk images "Ih_hr" (HR histology), "Mh_hr" (HR histology mask), "Im"
-        (MRI), "Mm" (MRI mask) and "Ih_rgb_hr" (RGB histology, or None if no file exists),
-        plus the resolved "spacing", "orientation", "rotation", "flip" and "paths".
+        (x, y, z) tuple of floats in mm.
     Raises:
-        FileNotFoundError: If a required file is missing.
-        ValueError: If a sidecar field or an override is malformed.
+        ValueError: If there are not one to three values, or one is not positive.
     """
-    paths = resolve_section(bids_root, subject, sample, stain)
+    values = [float(pixel_size_mm)] if np.isscalar(pixel_size_mm) else [float(v) for v in pixel_size_mm]
+    if not 1 <= len(values) <= 3:
+        raise ValueError(f"Expected one to three pixel size values, got {pixel_size_mm!r}")
+    if any(not math.isfinite(v) or v <= 0 for v in values):
+        raise ValueError(f"Pixel size must be positive, got {pixel_size_mm!r}")
+    if len(values) == 1:
+        values = values * 2
+    if len(values) == 2:
+        values.append(values[0])
+    return tuple(values)
 
-    metadata = read_section_metadata(paths["section_sidecar"])
-    orientation = metadata["orientation"] if orientation is None else parse_orientation(orientation)
-    rotation = metadata["rotation"] if rotation is None else parse_rotation(rotation)
-    flip = metadata["flip"] if flip is None else parse_flip(flip)
-    spacing = read_pixel_size_mm(paths["histo_sidecar"]) if spacing is None else tuple(spacing)
 
-    Ih_hr = load_slide(paths["histo_gray"], spacing)
-    Mh_hr = load_slide(paths["histo_mask"], spacing, as_mask=True)
+def load_files(histo, histo_mask, mri, mri_mask, *, orientation, pixel_size_mm,
+               rotation=0.0, flip="", histo_rgb=None, crop=None):
+    """Load one section from explicit files: histology, its mask, the MRI and its mask.
+
+    The file-level counterpart of load_section, for data that is not in a BIDS dataset:
+    what the sidecars would say is passed in. The histology is rotated and then flipped, in
+    that order; the MRI and its mask are reoriented to LPS, permuted for the cutting plane
+    and turned to the viewer frame (see load_mri).
+
+    Args:
+        histo: Gray histology image (a 2D TIFF or any format SimpleITK reads); its own
+            geometry is ignored and pixel_size_mm is used instead.
+        histo_mask: Tissue mask of the histology, same grid; non-zero is tissue.
+        mri: MRI volume with its geometry in the header (e.g. .nii.gz).
+        mri_mask: Brain mask on the MRI grid.
+        orientation: Cutting plane, "axial", "coronal" or "sagittal".
+        pixel_size_mm: Histology pixel size in mm; see pixel_size_to_spacing.
+        rotation: In-plane rotation in degrees, positive counter-clockwise; None means 0.
+        flip: Letters from x/y/z ("" for none), or an (x, y, z) tuple of booleans.
+        histo_rgb: Optional RGB histology on the same grid, used only for QC figures.
+        crop: Optional dict with "crop_origin_xy" and "source_shape_hw" (see
+            read_crop_metadata); both are None when omitted.
+    Returns:
+        The dict load_section returns; "paths" holds "histo_gray", "histo_mask",
+        "histo_rgb", "mri" and "mri_mask".
+    Raises:
+        FileNotFoundError: If a file, including a histo_rgb that was given, is missing.
+        ValueError: If orientation, rotation, flip or pixel size is malformed.
+    """
+    orientation = parse_orientation(orientation)
+    rotation = parse_rotation(rotation)
+    flip = parse_flip(flip) if flip is None or isinstance(flip, str) else tuple(bool(f) for f in flip)
+    if len(flip) != 3:
+        raise ValueError(f"flip must give three axes (x, y, z), got {flip!r}")
+    spacing = pixel_size_to_spacing(pixel_size_mm)
+    paths = {"histo_gray": histo, "histo_mask": histo_mask, "histo_rgb": histo_rgb,
+             "mri": mri, "mri_mask": mri_mask}
+
+    Ih_hr = load_slide(histo, spacing)
+    Mh_hr = load_slide(histo_mask, spacing, as_mask=True)
     # RGB histology is optional and only used for QC overlays.
-    Ih_rgb_hr = load_slide(paths["histo_rgb"], spacing) if os.path.exists(paths["histo_rgb"]) else None
+    Ih_rgb_hr = load_slide(histo_rgb, spacing) if histo_rgb is not None else None
 
     # The image as the TIFF stores it, kept to record the way back to that file.
     Ih_tif = Ih_hr
@@ -631,8 +661,8 @@ def load_section(bids_root, subject, sample, stain=None, *,
 
     A_hr_to_tif = A_rotated_to_tif @ A_flipped_to_rotated
 
-    Im = load_mri(paths["mri"], orientation, pixel_type=sitk.sitkFloat32)
-    Mm = load_mri(paths["mri_mask"], orientation)
+    Im = load_mri(mri, orientation, pixel_type=sitk.sitkFloat32)
+    Mm = load_mri(mri_mask, orientation)
 
     # Which axes load_mri reversed to reach the viewer frame: the difference between the
     # canonical permuted directions and the ones the loaded volume ended up with.
@@ -655,9 +685,54 @@ def load_section(bids_root, subject, sample, stain=None, *,
         # the rotation, the crop metadata undoes cleanslide's crop, and permute with
         # MRI_CANONICAL_ORIENTATION and mri_view_flip undoes what load_mri did to the volume.
         "A_hr_to_tif": A_hr_to_tif,
-        "crop": read_crop_metadata(paths["histo_sidecar"]),
+        "crop": dict(crop) if crop else {"crop_origin_xy": None, "source_shape_hw": None},
         "mri_permute": tuple(ORIENTATION_PERMUTE[orientation]),
         "mri_canonical": MRI_CANONICAL_ORIENTATION,
         "mri_view_flip": mri_view_flip,
         "mri_view_axes": axis_directions(Im),
     }
+
+
+def load_section(bids_root, subject, sample, stain=None, *,
+                 orientation=None, rotation=None, flip=None, spacing=None):
+    """Load one section's histology, its mask, the optional RGB histology, the MRI and its mask.
+
+    Finds the section's files in the BIDS dataset (resolve_section), reads the placement
+    fields and pixel size from its sidecars, and loads them with load_files. The spacing and
+    the three placement fields come from the sidecars unless they are passed in, which lets
+    a caller try another value without editing the dataset.
+
+    Args:
+        bids_root: Dataset root.
+        subject: Subject label, with or without the "sub-" prefix.
+        sample: Sample label, with or without the "sample-" prefix.
+        stain: Stain label; optional when subject and sample identify one section.
+        orientation: Override for SectionOrientation.
+        rotation: Override for SectionRotation, in degrees counter-clockwise.
+        flip: Override for SectionFlip, as the letters x/y/z.
+        spacing: Override for the histology (x, y, z) spacing in mm.
+    Returns:
+        Dict with sitk images "Ih_hr" (HR histology), "Mh_hr" (HR histology mask), "Im"
+        (MRI), "Mm" (MRI mask) and "Ih_rgb_hr" (RGB histology, or None if no file exists),
+        plus the resolved "spacing", "orientation", "rotation", "flip", "paths" (as
+        resolve_section returns them) and the frame fields described in load_files.
+    Raises:
+        FileNotFoundError: If a required file is missing.
+        ValueError: If a sidecar field or an override is malformed.
+    """
+    paths = resolve_section(bids_root, subject, sample, stain)
+
+    metadata = read_section_metadata(paths["section_sidecar"])
+    orientation = metadata["orientation"] if orientation is None else orientation
+    rotation = metadata["rotation"] if rotation is None else rotation
+    flip = metadata["flip"] if flip is None else flip
+    spacing = read_pixel_size_mm(paths["histo_sidecar"]) if spacing is None else tuple(spacing)
+
+    vols = load_files(
+        paths["histo_gray"], paths["histo_mask"], paths["mri"], paths["mri_mask"],
+        orientation=orientation, pixel_size_mm=spacing, rotation=rotation, flip=flip,
+        histo_rgb=paths["histo_rgb"] if os.path.exists(paths["histo_rgb"]) else None,
+        crop=read_crop_metadata(paths["histo_sidecar"]),
+    )
+    vols["paths"] = paths
+    return vols

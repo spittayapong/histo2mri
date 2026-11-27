@@ -86,29 +86,53 @@ Two things are worth knowing when filling these in:
 
 ## Usage
 
-histo2mri is a [BIDS App](https://bids-apps.neuroimaging.io/): it takes the dataset, the
+histo2mri has two subcommands: `register` runs one section given as explicit files, and
+`bids` runs the sections of a BIDS dataset.
+
+### One section from files
+
+Like FSL `bet`, `register` takes its inputs and output prefix as options. What a BIDS sidecar
+would hold (see Section metadata) is given on the command line instead:
+
+```bash
+histo2mri register \
+    --histo section.tif --histo-mask section_mask.tif \
+    --mri T1w.nii.gz --mri-mask brain_mask.nii.gz \
+    --orientation coronal --histo-pixel-size 5 --rotation 90 --flip y \
+    -o out/section
+```
+
+The outputs are written as `out/section_*`; a path ending in `/` uses the histology file name
+as the prefix. `--histo-pixel-size` is in micrometres (one value, or `X Y`); `--rotation`
+(degrees, positive counter-clockwise) and `--flip` (letters `x`/`y`) are applied in that order
+and default to none. `--histo-rgb` adds an RGB histology for the QC figures. The command exits
+with status 1 if the section fails, so a batch script can loop over sections and check it.
+
+### A BIDS dataset
+
+`bids` is a [BIDS App](https://bids-apps.neuroimaging.io/): it takes the dataset, the
 folder to write the derivative into, and the analysis level. The dataset is the list of what
 there is to process, so with no label options every section in it is run:
 
 ```bash
-histo2mri /path/to/bids /path/to/derivatives/histo2mri participant
+histo2mri bids /path/to/bids /path/to/derivatives/histo2mri participant
 ```
 
 `--participant-label`, `--sample-label` and `--stain-label` narrow that down. Each takes
 several labels and matches everything when left out, so this runs one section:
 
 ```bash
-histo2mri /path/to/bids out participant --participant-label NBP5816 --sample-label A2109
+histo2mri bids /path/to/bids out participant --participant-label NBP5816 --sample-label A2109
 ```
 
 and this runs every H&E section of two subjects:
 
 ```bash
-histo2mri /path/to/bids out participant --participant-label NBP5816 NBP8518 --stain-label HE
+histo2mri bids /path/to/bids out participant --participant-label NBP5816 NBP8518 --stain-label HE
 ```
 
 The output folder is a BIDS derivative: a `dataset_description.json` is written at its root.
-Useful options:
+Pipeline options, shared by both subcommands:
 
 | option | default | purpose |
 |---|---|---|
@@ -122,7 +146,8 @@ Useful options:
 | `--lam-area`, `--lam-shape` | 2.0, 0.0 | local rigidity in the refinement: area (properness) and shape (orthonormality); 0 disables |
 | `--w-rigid-mode` | `mask` | where rigidity applies: `mask`, `conf`, `edge` or `none` |
 | `--save-roi-qc` | off | also write the three ROI QC figures |
-| `--limit`, `--summary`, `--verbose` | | dry-run, summary path, full logging |
+| `--verbose` | off | full logging and each step as it starts |
+| `--limit`, `--summary` | | `bids` only: dry-run, summary path |
 
 One `--profile` applies to the whole run, so sections needing `he-cblock` are run separately.
 A run summary (`run_log_<timestamp>.tsv`, one row per section) is rewritten after every

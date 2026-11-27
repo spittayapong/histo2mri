@@ -1,6 +1,7 @@
 """Register one 2D histology section to a 3D MRI volume, running all pipeline steps in order.
 
-register_section is the per-section driver called by the command-line tool (histo2mri.cli).
+register_section (a section of a BIDS dataset) and register_files (a section given as explicit
+files) are the per-section drivers called by the command-line tool (histo2mri.cli).
 It ends with a curved sheet in MRI voxel space (xyz_norm, normalised (x, y, z) per axis) sampled
 on the common canvas, plus the index affine from the common canvas back to the full-resolution
 (HR) histology, and saves both to <subject>_<section>_transform_grid.npz. PROFILES holds named
@@ -16,7 +17,7 @@ import SimpleITK as sitk
 import torch
 from .canvas import create_common_canvas, extract_roi_plane
 from .inverse import build_hr_common_affines, mri_on_histology_space, sample_rgb_on_surface
-from .io import load_section, resolve_section
+from .io import load_files, load_section, resolve_section
 from .matching import match_patches, rescale_histology, search_patch_config, search_scale
 from .outliers import filter_outliers
 from .plane import fit_global_plane, matches_to_common_canvas
@@ -269,6 +270,81 @@ def register_section(bids_root, subject, sample, out_dir, *, stain=None,
         ValueError: If profile is not a key of PROFILES. Other errors from the steps (for
             example too few matches) propagate unchanged.
     """
+    # Resolved before the log is opened, because the log file is named after the section.
+    section_id = resolve_section(bids_root, subject, sample, stain)["base"]
+    return _run_section(
+        lambda: load_section(bids_root, subject, sample, stain), section_id, out_dir,
+        profile=profile, device=device, ransac_sample_size=ransac_sample_size,
+        pad_multiple=pad_multiple, pclip=pclip, scale_max=scale_max, scale_step=scale_step,
+        lam_area=lam_area, lam_shape=lam_shape, w_rigid_mode=w_rigid_mode,
+        mri_on_histo_tile_size=mri_on_histo_tile_size, matcher_settings=matcher_settings,
+        save_roi_qc=save_roi_qc, verbose=verbose,
+    )
+
+
+def _histo_stem(path):
+    """File name of path without its image extension(s), e.g. "a.ome.tif" -> "a"."""
+    name = os.path.basename(path)
+    for ext in (".ome.tiff", ".ome.tif", ".nii.gz", ".tiff", ".tif", ".png", ".jpg", ".nii", ".mha", ".nrrd"):
+        if name.lower().endswith(ext):
+            return name[: -len(ext)]
+    return os.path.splitext(name)[0]
+
+
+def register_files(histo, histo_mask, mri, mri_mask, out_dir, *, orientation, pixel_size_um,
+                   rotation=0.0, flip="", histo_rgb=None, section_id=None,
+                   profile="default", device=None, ransac_sample_size=5,
+                   pad_multiple=64, pclip=(1, 99), scale_max=1.30, scale_step=0.05,
+                   lam_area=2.0, lam_shape=0.0, w_rigid_mode="mask",
+                   mri_on_histo_tile_size=348, matcher_settings=None, save_roi_qc=False,
+                   verbose=False):
+    """Register one histology section given as explicit files, without a BIDS dataset.
+
+    The same pipeline as register_section; only the loading differs (io.load_files). What
+    the BIDS sidecars would provide -- cutting plane, rotation, flip and pixel size -- is
+    passed in, and there is no cleanslide crop to record (crop_origin_xy and
+    source_shape_hw are saved as -1, and subject_id, sample and stain as "").
+
+    Args:
+        histo: Gray histology image (2D TIFF or any format SimpleITK reads).
+        histo_mask: Tissue mask on the histology grid; non-zero is tissue.
+        mri: MRI volume with its geometry in the header (e.g. .nii.gz).
+        mri_mask: Brain mask on the MRI grid.
+        out_dir: Output folder; created if missing. Files with the same prefix are
+            overwritten.
+        orientation: Cutting plane: "axial", "coronal" or "sagittal".
+        pixel_size_um: Histology pixel size in micrometres: one number for square pixels,
+            or (x, y).
+        rotation: In-plane rotation in degrees, positive counter-clockwise, applied to the
+            histology before the flip (as SectionRotation in io).
+        flip: Letters from x/y/z, "" for none (as SectionFlip in io).
+        histo_rgb: Optional RGB histology on the same grid, used only for QC figures.
+        section_id: Prefix of the output files; defaults to the histology file name
+            without its extension.
+        profile, device, ...: As in register_section.
+
+    Returns:
+        As register_section. The files written are those listed there, prefixed with
+        section_id.
+    """
+    pixel_size_mm = (np.asarray(pixel_size_um, dtype=np.float64) * 1e-3).tolist()
+    section_id = section_id or _histo_stem(histo)
+    return _run_section(
+        lambda: load_files(histo, histo_mask, mri, mri_mask, orientation=orientation,
+                           pixel_size_mm=pixel_size_mm, rotation=rotation, flip=flip,
+                           histo_rgb=histo_rgb),
+        section_id, out_dir,
+        profile=profile, device=device, ransac_sample_size=ransac_sample_size,
+        pad_multiple=pad_multiple, pclip=pclip, scale_max=scale_max, scale_step=scale_step,
+        lam_area=lam_area, lam_shape=lam_shape, w_rigid_mode=w_rigid_mode,
+        mri_on_histo_tile_size=mri_on_histo_tile_size, matcher_settings=matcher_settings,
+        save_roi_qc=save_roi_qc, verbose=verbose,
+    )
+
+
+def _run_section(load, section_id, out_dir, *, profile, device, matcher_settings, verbose,
+                 **params):
+    """Check the settings, attach the section log and run _register with the given loader."""
     if profile not in PROFILES:
         raise ValueError(f"Unknown profile {profile!r}; expected one of {list(PROFILES)}")
     settings = PROFILES[profile]
@@ -276,32 +352,27 @@ def register_section(bids_root, subject, sample, out_dir, *, stain=None,
     matcher = dict(MATCHER_SETTINGS if matcher_settings is None else matcher_settings, device=device)
 
     os.makedirs(out_dir, exist_ok=True)
-    # Resolved before the log is opened, because the log file is named after the section.
-    section_id = resolve_section(bids_root, subject, sample, stain)["base"]
     log_path = os.path.join(out_dir, f"{section_id}_process.log")
     with _section_log(log_path), (contextlib.nullcontext() if verbose else figures_hidden()):
-        return _register(
-            bids_root, subject, sample, stain, section_id, out_dir,
-            profile=profile, device=device, ransac_sample_size=ransac_sample_size,
-            pad_multiple=pad_multiple, pclip=pclip, scale_max=scale_max, scale_step=scale_step,
-            lam_area=lam_area, lam_shape=lam_shape, w_rigid_mode=w_rigid_mode,
-            mri_on_histo_tile_size=mri_on_histo_tile_size, save_roi_qc=save_roi_qc,
-            verbose=verbose, settings=settings, matcher=matcher,
-        )
+        return _register(load, section_id, out_dir, profile=profile, device=device,
+                         verbose=verbose, settings=settings, matcher=matcher, **params)
 
 
-def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
+def _register(load, section_id, out_dir, *,
               profile, device, ransac_sample_size, pad_multiple, pclip, scale_max, scale_step,
               lam_area, lam_shape, w_rigid_mode, mri_on_histo_tile_size, save_roi_qc, verbose,
               settings, matcher):
-    """Body of register_section, run while the section log file is attached."""
+    """Body of register_section and register_files, run while the section log is attached.
+
+    load() returns the dict of io.load_section / io.load_files.
+    """
     logger.info("Process started")
     logger.info(f"Profile: {profile} {settings}")
     section_start = time.perf_counter()
 
     # ---- Load ----
     _progress("Load the section and its MRI", verbose)
-    vols = load_section(bids_root, subject, sample, stain)
+    vols = load()
     Ih_hr, Mh_hr, Im, Mm = vols["Ih_hr"], vols["Mh_hr"], vols["Im"], vols["Mm"]
     Ih_rgb_hr = vols.get("Ih_rgb_hr")
     paths = vols["paths"]
@@ -673,9 +744,10 @@ def _register(bids_root, subject, sample, stain, section_id, out_dir, *,
         crop_origin_xy=np.asarray(vols["crop"]["crop_origin_xy"] or (-1, -1), dtype=np.int64),
         source_shape_hw=np.asarray(vols["crop"]["source_shape_hw"] or (-1, -1), dtype=np.int64),
         histo_source=np.array(paths["histo_gray"]),
-        subject_id=np.array(paths["subject"]),
-        sample=np.array(paths["sample"]),
-        stain=np.array(paths["stain"]),
+        # Empty for a section loaded from explicit files (register_files), which has no labels.
+        subject_id=np.array(paths.get("subject", "")),
+        sample=np.array(paths.get("sample", "")),
+        stain=np.array(paths.get("stain", "")),
         section_id=np.array(section_id),
         profile=np.array(profile),
         version=np.array([5], dtype=np.int32),
