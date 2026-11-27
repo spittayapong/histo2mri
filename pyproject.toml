@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "histo2mri"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "Registration of 2D histology sections to a 3D MRI volume"
 readme = "README.md"
 requires-python = ">=3.11"

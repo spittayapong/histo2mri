@@ -62,8 +62,8 @@ authors:
     affiliation: >-
       Department of Medical Engineering, Carinthia University of Applied Sciences,
       Klagenfurt, Austria
-version: 0.1.0-alpha1
-date-released: "2026-11-18"
+version: 0.1.0-alpha2
+date-released: "2026-11-27"
 license: MIT
 repository-code: "https://github.com/spittayapong/histo2mri"
 keywords:
